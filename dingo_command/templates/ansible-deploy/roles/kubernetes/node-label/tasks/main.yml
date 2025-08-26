@@ -9,7 +9,23 @@
   until: result.status == 200
   retries: 10
   delay: 6
-  when: inventory_hostname == groups['kube_control_plane'][0]
+  when:
+    - not (hosted_k8s | default(false))
+    - inventory_hostname == groups['kube_control_plane'][0]
+
+# 托管版K8s：检查集群连接性
+- name: Hosted K8s | Check cluster connectivity
+  command: "{{ kubectl }} get nodes --request-timeout=10s"
+  environment:
+    KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"
+  register: result
+  until: result.rc == 0
+  retries: 10
+  delay: 6
+  delegate_to: localhost
+  when:
+    - hosted_k8s | default(false)
+    - tenant_cluster_kubeconfig is defined
 
 - name: Set role node label to empty list
   set_fact:
@@ -46,4 +62,20 @@
   loop: "{{ role_node_labels + inventory_node_labels }}"
   delegate_to: "{{ groups['kube_control_plane'][0] }}"
   changed_when: false
+  when:
+    - not (hosted_k8s | default(false))
+
+# 托管版K8s：在本地执行节点设置标签
+- name: Set label to node (Hosted K8s)
+  command: >-
+      {{ kubectl }} label node {% if kube_override_hostname %}{{ kube_override_hostname }}{% else %}{{ inventory_hostname }}{% endif %} {{ item }} --overwrite=true
+  loop: "{{ role_node_labels + inventory_node_labels }}"
+  environment:
+    KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"
+  delegate_to: localhost
+  changed_when: false
+  when:
+    - hosted_k8s | default(false)
+    - tenant_cluster_kubeconfig is defined
 ...
+

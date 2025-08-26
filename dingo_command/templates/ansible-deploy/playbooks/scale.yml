@@ -50,6 +50,7 @@
         - etcd_deployment_type != "kubeadm"
         - kube_network_plugin in ["calico", "flannel", "canal", "cilium"] or cilium_deploy_additionally | default(false) | bool
         - kube_network_plugin != "calico" or calico_datastore == "etcd"
+        - not (hosted_k8s | default(false))
 
 - name: Target only workers to get kubelet installed and checking in on any new nodes(node)
   hosts: kube_node
@@ -80,7 +81,8 @@
     - name: Set fact 'kubeadm_certificate_key' for later use
       set_fact:
         kubeadm_certificate_key: "{{ kubeadm_upload_cert.stdout_lines[-1] | trim }}"
-      when: kubeadm_certificate_key is not defined
+      when:
+        - kubeadm_certificate_key is not defined
 
 - name: Target only workers to get kubelet installed and checking in on any new nodes(network)
   hosts: kube_node
@@ -92,7 +94,8 @@
     - { role: kubernetes/kubeadm, tags: kubeadm }
     - { role: kubernetes/node-label, tags: node-label }
     - { role: kubernetes/node-taint, tags: node-taint }
-    - { role: network_plugin, tags: network }
+    - { role: kubernetes-apps/policy_controller, tags: policy-controller, when: hosted_k8s }
+    - { role: network_plugin, tags: network}
 
 - name: Apply resolv.conf changes now that cluster DNS is up
   hosts: k8s_cluster
@@ -102,3 +105,4 @@
   roles:
     - { role: kubespray-defaults }
     - { role: kubernetes/preinstall, when: "dns_mode != 'none' and resolvconf_mode == 'host_resolvconf'", tags: resolvconf, dns_late: true }
+

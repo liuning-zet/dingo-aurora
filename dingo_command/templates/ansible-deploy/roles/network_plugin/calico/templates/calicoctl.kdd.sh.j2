@@ -1,6 +1,8 @@
 #!/bin/bash
 DATASTORE_TYPE=kubernetes \
-{% if inventory_hostname in groups['kube_control_plane'] %}
+{% if hosted_k8s | default(false) %}
+KUBECONFIG="{{ tenant_cluster_kubeconfig }}" \
+{% elif inventory_hostname in groups['kube_control_plane'] %}
 KUBECONFIG=/etc/kubernetes/admin.conf \
 {% else %}
 KUBECONFIG=/etc/cni/net.d/calico-kubeconfig \

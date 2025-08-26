@@ -60,15 +60,19 @@ class ClusterService:
         if cluster.forward_float_ip_id:
             forward_float_ip_id = cluster.forward_float_ip_id
         # 在这里要判断cluster的类型是不是k8s的类型，如果是才需要生成k8s_masters和k8s_nodes
-        if cluster.type != "kubernetes":
+        if cluster.type not in ("kubernetes", "hosted_k8s"):
             return [], []
         node_db_list, instance_db_list = [], []
         node_index = 1
         master_index = 1
         cluster_new = copy.deepcopy(cluster)
-        (master_cpu, master_gpu, master_mem, master_disk,
-         master_flavor_id) = self.get_master_flavor_info(master_flvaor)
-        master_operation_system, master_image_id = self.get_master_image_info(master_image)
+
+        # 只有 kubernetes 类型才需要获取 master 相关的配置信息
+        if cluster.type == "kubernetes":
+            (master_cpu, master_gpu, master_mem, master_disk,
+             master_flavor_id) = self.get_master_flavor_info(master_flvaor)
+            master_operation_system, master_image_id = self.get_master_image_info(master_image)
+
         worker_node = []
         for idx, node in enumerate(cluster.node_config):
             if node.role == "master" and node.type == "vm":
@@ -389,6 +393,7 @@ class ClusterService:
             query_params = {}
             query_params["cluster_id"] = cluster_id
             res = NodeService().list_nodes(query_params, 1, 10, None, None)
+            # 需要确认托管版k8s的浮动ip？
             forward_float_ip = ""
             if len(res.get("data")) > 0:
                 forward_float_ip = res.get("data")[0].floating_ip
@@ -475,8 +480,8 @@ class ClusterService:
                 if c.status != "deleted":
                     # 如果查询结果不为空，说明集群名称已存在+
                     raise Fail(error_code=405, error_message="Cluster name already exists")
-        if cluster.type not in ("kubernetes", "baremetal"):
-            raise Fail(error_code=405, error_message="Cluster type must be kubernetes or baremetal")
+        if cluster.type not in ("kubernetes", "baremetal", "hosted_k8s"):
+            raise Fail(error_code=405, error_message="Cluster type must be kubernetes or baremetal or hosted_k8s")
         if not cluster.node_config:
             raise Fail(error_code=405, error_message="Cluster node_config parameter cannot be empty")
         else:
@@ -533,7 +538,8 @@ class ClusterService:
             external_net = neutron_api.list_external_networks()
 
             lb_enbale = False
-            if cluster.type == "kubernetes":
+            #  "hosted_k8s" 托管版默认是负载均衡的，通过openstack ccm创建lb 需确认？
+            if cluster.type in ("kubernetes"):
                 lb_enbale = cluster.kube_info.loadbalancer_enabled
 
            
@@ -545,6 +551,7 @@ class ClusterService:
 
             # 保存instance信息到数据库
             instance_db_list, instance_bm_list = self.convert_instance_todb(cluster, k8s_nodes)
+            # 需要确认是否重复？
             InstanceSQL.create_instance_list(instance_db_list)
             # 生成一个随机的私有cidr
             subnet_cidr = self.generate_random_cidr()
@@ -592,6 +599,12 @@ class ClusterService:
                 result = celery_app.send_task("dingo_command.celery_api.workers.create_cluster",
                                           args=[tfvars.dict(), cluster.dict(), instance_bm_list ])
             elif cluster.type == "kubernetes":
+                result = celery_app.send_task("dingo_command.celery_api.workers.create_k8s_cluster",
+                                          args=[tfvars.dict(), cluster.dict(), node_list, instance_list ])
+            elif cluster.type == "hosted_k8s":
+                # hosted_k8s 类型：托管版，不需要 master 节点
+                tfvars.number_of_k8s_masters = 0
+                tfvars.number_of_k8s_masters_no_floating_ip = 0
                 result = celery_app.send_task("dingo_command.celery_api.workers.create_k8s_cluster",
                                           args=[tfvars.dict(), cluster.dict(), node_list, instance_list ])
             elif cluster.type == "slurm":
@@ -1202,7 +1215,7 @@ class TaskService:
             tasks = res[1]
             if cluster.type == "baremetal":
                 tasks_with_title = self.handle_task(tasks, TaskService.TaskBaremetalMessage, tasks_with_title)
-            elif cluster.type == "kubernetes":
+            elif cluster.type in ("kubernetes", "hosted_k8s"):
                 tasks_with_title = self.handle_task(tasks, TaskService.TaskMessage, tasks_with_title)
             else:
                 pass
@@ -1237,7 +1250,7 @@ class TaskService:
             if cluster.type == "baremetal":
                 tasks_with_title = self.handle_task(tasks, TaskService.TaskScaleBaremetalMessage,
                                                     tasks_with_title, task_id)
-            elif cluster.type == "kubernetes":
+            elif cluster.type in ("kubernetes", "hosted_k8s"):
                 tasks_with_title = self.handle_task(tasks, TaskService.TaskScaleNodeMessage, tasks_with_title, task_id)
             else:
                 pass
@@ -1272,7 +1285,7 @@ class TaskService:
             if cluster.type == "baremetal":
                 tasks_with_title = self.handle_task(tasks, TaskService.TaskRemoveBaremetalMessage,
                                                     tasks_with_title, task_id)
-            elif cluster.type == "kubernetes":
+            elif cluster.type in ("kubernetes", "hosted_k8s"):
                 tasks_with_title = self.handle_task(tasks, TaskService.TaskRemoveNodeMessage, tasks_with_title, task_id)
             else:
                 pass

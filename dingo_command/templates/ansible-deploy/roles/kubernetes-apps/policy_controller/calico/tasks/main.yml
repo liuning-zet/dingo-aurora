@@ -1,4 +1,5 @@
 ---
+# 专属版K8s环境：使用原有安装逻辑
 - name: Create calico-kube-controllers manifests
   template:
     src: "{{ item.file }}.j2"
@@ -11,6 +12,7 @@
     - {name: calico-kube-controllers, file: calico-kube-crb.yml, type: clusterrolebinding}
   register: calico_kube_manifests
   when:
+    - not hosted_k8s
     - inventory_hostname == groups['kube_control_plane'][0]
     - rbac_enabled or item.type not in rbac_resources
 
@@ -28,7 +30,64 @@
   until: calico_kube_controller_start is succeeded
   retries: 4
   when:
+    - not hosted_k8s
     - inventory_hostname == groups['kube_control_plane'][0]
     - not item is skipped
   loop_control:
     label: "{{ item.item.file }}"
+
+# 托管版K8s专用Calico kube-controller安装文件
+# 简化版本，移除不必要的功能，所有操作都在localhost执行
+
+# 1. 检查calico-kube-controllers是否已经安装
+- name: Calico | Check if calico-kube-controllers is already installed
+  shell: "{{ bin_dir }}/kubectl get deployment calico-kube-controllers -n kube-system --output=name"
+  register: calico_kube_controller_check
+  ignore_errors: true
+  changed_when: false
+  delegate_to: localhost
+  when: hosted_k8s
+  environment:
+    KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"
+
+# 2. 创建calico-kube-controllers manifests (只在localhost执行一次)
+- name: Calico | Create calico-kube-controllers manifests
+  template:
+    src: "{{ item.file }}.j2"
+    dest: "{{ kube_config_dir }}/{{ item.file }}"
+    mode: "0644"
+  with_items:
+    - {name: calico-kube-controllers, file: calico-kube-controllers.yml, type: deployment}
+    - {name: calico-kube-controllers, file: calico-kube-sa.yml, type: sa}
+    - {name: calico-kube-controllers, file: calico-kube-cr.yml, type: clusterrole}
+    - {name: calico-kube-controllers, file: calico-kube-crb.yml, type: clusterrolebinding}
+  register: calico_kube_manifests_hosted
+  delegate_to: localhost
+  when:
+    - hosted_k8s
+    - rbac_enabled or item.type not in rbac_resources
+    - calico_kube_controller_check.stdout == ""
+
+# 3. 部署calico-kube-controllers (只在localhost执行一次)
+- name: Calico | Start calico-kube-controllers
+  kube:
+    name: "{{ item.item.name }}"
+    namespace: "kube-system"
+    kubectl: "{{ bin_dir }}/kubectl"
+    resource: "{{ item.item.type }}"
+    filename: "{{ kube_config_dir }}/{{ item.item.file }}"
+    state: "latest"
+  with_items:
+    - "{{ calico_kube_manifests_hosted.results }}"
+  register: calico_kube_controller_start
+  until: calico_kube_controller_start is succeeded
+  retries: 4
+  when:
+    - hosted_k8s
+    - not item is skipped
+    - calico_kube_controller_check.stdout == ""
+  loop_control:
+    label: "{{ item.item.file }}"
+  delegate_to: localhost
+  environment:
+    KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"
