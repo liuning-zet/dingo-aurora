@@ -1,0 +1,31 @@
+---
+apiVersion: kubeadm.k8s.io/{{ kubeadm_config_api_version }}
+kind: JoinConfiguration
+discovery:
+  bootstrapToken:
+    apiServerEndpoint: {{ hosted_k8s_discovery_address | default(hosted_k8s_apiserver_endpoint | replace('https://', '')) }}
+    token: "{{ hosted_k8s_join_token | default('') }}"
+    caCertHashes:
+    - sha256:{{ hosted_k8s_ca_hash | default('') }}
+  tlsBootstrapToken: "{{ hosted_k8s_join_token | default('') }}"
+{# TODO: drop the if when we drop support for k8s<1.31 #}
+{% if kubeadm_config_api_version == 'v1beta3' %}
+  timeout: {{ discovery_timeout }}
+{% else %}
+timeouts:
+  discovery: {{ discovery_timeout }}
+{% endif %}
+# 托管版K8s不需要本地CA证书路径，因为使用外部控制面
+# caCertPath: {{ kube_cert_dir }}/ca.crt
+nodeRegistration:
+  name: '{{ kube_override_hostname }}'
+  criSocket: {{ cri_socket }}
+{% if 'calico_rr' in group_names and 'kube_node' not in group_names %}
+  taints:
+  - effect: NoSchedule
+    key: node-role.kubernetes.io/calico-rr
+{% endif %}
+{% if kubeadm_patches | length > 0 %}
+patches:
+  directory: {{ kubeadm_patches_dir }}
+{% endif %}

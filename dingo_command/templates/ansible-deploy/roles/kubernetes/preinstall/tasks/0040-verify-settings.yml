@@ -18,7 +18,9 @@
   assert:
     that: groups.get( 'kube_control_plane' )
   run_once: true
-  when: not ignore_assert_errors
+  when:
+    - not ignore_assert_errors
+    - not (hosted_k8s | default(false))
 
 - name: Stop if etcd group is empty in external etcd mode
   assert:
@@ -27,6 +29,7 @@
   run_once: true
   when:
     - not ignore_assert_errors
+    - not (hosted_k8s | default(false))
 
 - name: Stop if non systemd OS type
   assert:
@@ -70,6 +73,7 @@
   run_once: true
   when:
     - not ignore_assert_errors
+    - not (hosted_k8s | default(false))
 
 - name: Stop if memory is too small for control plane nodes
   assert:
@@ -77,6 +81,7 @@
   when:
     - not ignore_assert_errors
     - ('kube_control_plane' in group_names)
+    - not (hosted_k8s | default(false))
 
 - name: Stop if memory is too small for nodes
   assert:
@@ -287,3 +292,4 @@
   assert:
     that: "pkgs_lists | sort == pkgs_lists"
     fail_msg: "pkgs is not sorted: {{ pkgs_lists | ansible.utils.fact_diff(pkgs_lists | sort) }}"
+

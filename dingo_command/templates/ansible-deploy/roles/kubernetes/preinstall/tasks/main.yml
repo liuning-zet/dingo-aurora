@@ -172,6 +172,7 @@
   when:
     - kube_network_plugin == 'calico'
     - not ignore_assert_errors
+    - not (hosted_k8s | default(false))
 
 - name: Add nameservers block to the beginning of resolv.conf
   blockinfile:

@@ -9,7 +9,8 @@ import subprocess
 import time
 import copy
 import uuid
-from typing import Dict, Optional, List
+import yaml
+from typing import Dict, Optional, List, Any
 from dingo_command.api.model.cluster import ClusterObject
 from dingo_command.api.model.instance import InstanceCreateObject
 from dingo_command.celery_api.ansible import run_playbook
@@ -33,6 +34,7 @@ from dingo_command.common.nova_client import NovaClient
 from dingo_command.common import neutron
 from dingo_command.common.network import init_cluster_network 
 from dingo_command.common.cinder_client import CinderClient
+from dingo_command.common.k8s_client import K8sClient
 from celery.exceptions import SoftTimeLimitExceeded
 
 from dingo_command.db.models.node.sql import NodeSQL
@@ -64,6 +66,9 @@ CUSTOM_HOSTS = CONF.DEFAULT.customize_hosts
 NAMESERVERS = CONF.DEFAULT.nameservers
 image_master_id = ServiceConf.DEFAULT.k8s_master_image
 k8s_master_flavor = ServiceConf.DEFAULT.k8s_master_flavor
+
+# 管理集群配置
+MANAGEMENT_CLUSTER_KUBECONFIG_PATH = CONF.DEFAULT.get("management_cluster.kubeconfig_path", "/home/dingo-command/kubeconfig/management_cluster")
 
 runtime_task_name = "Check container-engine status"
 etcd_task_name = "Check etcd cluster status"
@@ -487,7 +492,17 @@ def deploy_kubernetes(cluster: ClusterObject, lb_ip: str, task_id: str = None):
             "container_manager": cluster.kube_info.runtime,
             "custom_hosts": CUSTOM_HOSTS,
             "nameservers": NAMESERVERS,
+            "kube_pod_cidr": cluster.kube_info.pod_cidr or "10.233.64.0/18",
         }
+        # 如果是托管版K8s，添加额外配置
+        if cluster.type == "hosted_k8s":
+            context.update({
+                'hosted_k8s': True,
+                'hosted_k8s_apiserver_endpoint': lb_ip + ":6443",
+                'hosted_k8s_ca_hash': "",
+                'hosted_k8s_join_token': "",
+                'tenant_cluster_kubeconfig': os.path.join(WORK_DIR, "ansible-deploy", "inventory", str(cluster.id), "tenant-cluster-kubeconfig"),
+            })
         target_dir = os.path.join(WORK_DIR, "ansible-deploy", "inventory", str(cluster.id), "group_vars", "k8s_cluster")
         os.makedirs(target_dir, exist_ok=True)
         cluster_file = os.path.join(target_dir, "k8s-cluster.yml")
@@ -500,7 +515,11 @@ def deploy_kubernetes(cluster: ClusterObject, lb_ip: str, task_id: str = None):
         ansible_dir = os.path.join(WORK_DIR, "ansible-deploy")
         os.chdir(ansible_dir)
         host_file = os.path.join(WORK_DIR, "ansible-deploy", "inventory", str(cluster.id))
-        playbook_file = os.path.join(WORK_DIR, "ansible-deploy", "cluster.yml")
+        if cluster.type == "hosted_k8s":
+            playbook_file = os.path.join(WORK_DIR, "ansible-deploy", "scale.yml")
+        else:
+            playbook_file = os.path.join(WORK_DIR, "ansible-deploy", "cluster.yml")
+
         key_file_path = os.path.join(WORK_DIR, "ansible-deploy", "inventory", str(cluster.id), "id_rsa")
         private_key_content = None
         if os.path.exists(key_file_path):
@@ -1201,21 +1220,24 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
         # Give execute permissions to the host file
         host_file = os.path.join(WORK_DIR, "ansible-deploy", "inventory", cluster_tf_dict["id"], "hosts")
         os.chmod(host_file, 0o755)  # rwxr-xr-x permission
-        master_ip, lb_ip, hosts_data = get_ips(cluster_tfvars, task_info, host_file, cluster_dir)
-        # ensure /root/.ssh/known_hosts exists
-        if os.path.exists("/root/.ssh/known_hosts"):
-            for i in range(1, cluster_tfvars.number_of_k8s_masters + 1):
-                print(f"delete host from know_hosts  {task_id}")
-                master_node_name = f"{cluster_tfvars.cluster_name}-k8s-master-{i}"
-                tmp_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
-                cmd = f'ssh-keygen -f "/root/.ssh/known_hosts" -R "{tmp_ip}"'
-                result = subprocess.run(cmd, shell=True, capture_output=True)
-                if result.returncode != 0:
-                    task_info.end_time = datetime.fromtimestamp(datetime.now().timestamp())
-                    task_info.state = "failed"
-                    task_info.detail = "Ansible kubernetes deployment failed, configure ssh-keygen error"
-                    update_task_state(task_info)
-                    raise Exception("Ansible kubernetes deployment failed, configure ssh-keygen error")
+
+        # SSH 免密登录配置 - 根据集群类型处理
+        if cluster.type == "kubernetes":
+            master_ip, lb_ip, hosts_data = get_ips(cluster_tfvars, task_info, host_file, cluster_dir)
+            # 清理 known_hosts 中的 master 节点记录
+            if os.path.exists("/root/.ssh/known_hosts"):
+                for i in range(1, cluster_tfvars.number_of_k8s_masters + 1):
+                    print(f"delete host from know_hosts  {task_id}")
+                    master_node_name = f"{cluster_tfvars.cluster_name}-k8s-master-{i}"
+                    tmp_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
+                    cmd = f'ssh-keygen -f "/root/.ssh/known_hosts" -R "{tmp_ip}"'
+                    result = subprocess.run(cmd, shell=True, capture_output=True)
+                    if result.returncode != 0:
+                        task_info.end_time = datetime.fromtimestamp(datetime.now().timestamp())
+                        task_info.state = "failed"
+                        task_info.detail = "Ansible kubernetes deployment failed, configure ssh-keygen error"
+                        update_task_state(task_info)
+                        raise Exception("Ansible kubernetes deployment failed, configure ssh-keygen error")
 
 
         # 执行ansible命令验证是否能够连接到所有节点
@@ -1299,11 +1321,7 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
             raise Exception(f"Error generating Ansible inventory: {str(res.stderr)}")
         hosts = res.stdout
         hosts_data = json.loads(hosts)
-        # 从_meta.hostvars中获取master节点的IP
-        master_node_name = cluster_tfvars.cluster_name + "-k8s-master-1"
-        master_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ip"]
-        float_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
-        ssh_port = hosts_data["_meta"]["hostvars"][master_node_name].get("ansible_port", 22)
+
         task_info.end_time = datetime.fromtimestamp(datetime.now().timestamp())
         task_info.state = "success"
         task_info.detail = TaskService.TaskDetail.pre_install.value
@@ -1314,12 +1332,59 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
         if scale:
             ansible_result = scale_kubernetes(cluster.id, scale_nodes, task_id)
         else:
+            if cluster.type == "hosted_k8s":
+                # hosted_k8s 类型：使用 Kamaji 创建托管控制平面
+                print(f"开始为 hosted_k8s 集群 {cluster.name} 创建 Kamaji TenantControlPlane")
+
+                # 更新任务状态为正在创建 Kamaji 控制平面
+                task_info.detail = "正在创建 Kamaji 控制平面..."
+                update_task_state(task_info)
+
+                tcp_created = create_kamaji_tenant_control_plane(cluster, cluster_tfvars)
+                if not tcp_created:
+                    raise Exception("创建 Kamaji TenantControlPlane 失败")
+
+                # 更新任务状态为等待控制平面就绪
+                task_info.detail = "Kamaji 控制平面创建成功，等待就绪..."
+                update_task_state(task_info)
+
+                tcp_ready, control_plane_endpoint = get_tenant_control_plane_status(cluster)
+                if not tcp_ready:
+                    raise Exception("TenantControlPlane 准备就绪超时")
+
+                # 更新任务状态为获取 kubeconfig
+                task_info.detail = "控制平面就绪，正在获取 kubeconfig..."
+                update_task_state(task_info)
+
+                # 获取租户集群的kubeconfig
+                kube_config = get_tenant_control_plane_kubeconfig(cluster)
+                if not kube_config:
+                    raise Exception("无法获取 TenantControlPlane 的 kubeconfig")
+
+                # 将租户集群kubeconfig写入inventory目录
+                tenant_kubeconfig_path = os.path.join(WORK_DIR, "ansible-deploy", "inventory", str(cluster.id), "tenant-cluster-kubeconfig")
+                with open(tenant_kubeconfig_path, 'w') as f:
+                    f.write(kube_config)
+                print(f"已写入租户集群kubeconfig到: {tenant_kubeconfig_path}")
+
+                # 对于 hosted_k8s，使用控制平面 endpoint 作为 lb_ip
+                lb_ip = control_plane_endpoint.split(':')[0]  # 提取 IP 地址部分
+            else:
+                # 从_meta.hostvars中获取master节点的IP
+                master_node_name = cluster_tfvars.cluster_name + "-k8s-master-1"
+                master_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ip"]
+                float_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
+                ssh_port = hosts_data["_meta"]["hostvars"][master_node_name].get("ansible_port", 22)
+
             ansible_result = deploy_kubernetes(cluster, lb_ip, task_id)
+
         if not ansible_result[0]:
             raise Exception(f"Ansible kubernetes deployment failed: {ansible_result[1]}")
+
         # 阻塞线程，直到ansible_client.get_playbook_result()返回结果
         # 获取集群的kube_config
-        kube_config = get_cluster_kubeconfig(cluster_tfvars,lb_ip,master_ip,float_ip,ssh_port)
+        if cluster.type == "kubernetes":
+            kube_config = get_cluster_kubeconfig(cluster_tfvars, lb_ip, master_ip, float_ip, ssh_port)
         # 更新集群状态为running
         query_params = {}
         query_params["id"] = cluster_dict["id"]
@@ -1524,6 +1589,54 @@ def delete_cluster(self, cluster_id, token):
             update_task_state(task_info)
             return True
 
+        # 1. 先删除 Kamaji TenantControlPlane（如果是托管版K8s）
+        try:
+            # 查询集群信息以确定类型
+            query_params = {}
+            query_params["id"] = cluster_id
+            count, db_clusters = ClusterSQL.list_clusters(query_params, 1, 10, None, None)
+            if count > 0 and db_clusters.get("data"):
+                cluster_info = db_clusters.get("data")[0]
+                if cluster_info.type == "hosted_k8s":
+                    print(f"检测到托管版K8s集群，开始删除 Kamaji TenantControlPlane")
+
+                    # 更新任务状态为正在删除 Kamaji TCP
+                    task_info.detail = "正在删除 Kamaji TenantControlPlane..."
+                    update_task_state(task_info)
+
+                    tcp_name = f"{cluster_info.name}-tenant-control-plane"
+                    namespace = cluster_info.project_id
+
+                    # 删除 TenantControlPlane
+                    tcp_deleted = delete_kamaji_tenant_control_plane(tcp_name, namespace)
+                    if tcp_deleted:
+                        print(f"成功删除 TenantControlPlane: {tcp_name}")
+
+                        # 更新任务状态为 Kamaji TCP 删除成功
+                        task_info.detail = "Kamaji TenantControlPlane 删除成功，等待资源清理..."
+                        update_task_state(task_info)
+
+                        # 等待一段时间确保资源完全清理
+                        time.sleep(10)
+
+                        # 更新任务状态为资源清理完成
+                        task_info.detail = "Kamaji TenantControlPlane 资源清理完成，开始删除基础设施..."
+                        update_task_state(task_info)
+                    else:
+                        print(f"删除 TenantControlPlane 失败，但继续执行基础设施删除")
+
+                        # 更新任务状态为 Kamaji TCP 删除失败但继续执行
+                        task_info.detail = "Kamaji TenantControlPlane 删除失败，但继续执行基础设施删除..."
+                        update_task_state(task_info)
+        except Exception as e:
+            print(f"删除 Kamaji TenantControlPlane 时发生错误: {str(e)}")
+            print("继续执行基础设施删除操作")
+
+            # 更新任务状态为 Kamaji TCP 删除出错但继续执行
+            task_info.detail = f"删除 Kamaji TenantControlPlane 时发生错误: {str(e)}，但继续执行基础设施删除..."
+            update_task_state(task_info)
+
+        # 2. 开始删除基础设施
         terraform_dir = os.path.join(cluster_dir, "terraform")
         print(f"Terraform dir: {terraform_dir}")
 
@@ -1730,46 +1843,50 @@ def delete_node(self, cluster_id, cluster_name, node_list, instance_list, extrav
             cluster_tfvars = ClusterTFVarsObject()
             cluster_tfvars.cluster_name = cluster_name
             cluster_tfvars.number_of_k8s_masters = content.get("number_of_k8s_masters", 1)
+            if cluster_tfvars.type == "hosted_k8s":
+                cluster_tfvars.number_of_k8s_masters = 0
             cluster_tfvars.ssh_user = content.get("ssh_user")
             cluster_tfvars.password = content.get("password")
-            master_ip, lb_ip, hosts_data = get_ips(cluster_tfvars, task_info, host_file, cluster_dir)
-            # ensure /root/.ssh/known_hosts exists
-            if os.path.exists("/root/.ssh/known_hosts"):
-                for i in range(1, cluster_tfvars.number_of_k8s_masters + 1):
-                    print(f"delete host from know_hosts  {task_id}")
-                    master_node_name = f"{cluster_name}-k8s-master-{i}"
-                    tmp_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
-                    cmd = f'ssh-keygen -f "/root/.ssh/known_hosts" -R "{tmp_ip}"'
-                    result = subprocess.run(cmd, shell=True, capture_output=True)
+
+            if cluster_tfvars.type == "kubernetes":
+                master_ip, lb_ip, hosts_data = get_ips(cluster_tfvars, task_info, host_file, cluster_dir)
+                # ensure /root/.ssh/known_hosts exists
+                if os.path.exists("/root/.ssh/known_hosts"):
+                    for i in range(1, cluster_tfvars.number_of_k8s_masters + 1):
+                        print(f"delete host from know_hosts  {task_id}")
+                        master_node_name = f"{cluster_name}-k8s-master-{i}"
+                        tmp_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
+                        cmd = f'ssh-keygen -f "/root/.ssh/known_hosts" -R "{tmp_ip}"'
+                        result = subprocess.run(cmd, shell=True, capture_output=True)
+                        if result.returncode != 0:
+                            task_info.end_time = datetime.fromtimestamp(datetime.now().timestamp())
+                            task_info.state = "failed"
+                            task_info.detail = "Ansible kubernetes deployment failed, configure ssh-keygen error"
+                            update_task_state(task_info)
+                            raise Exception("Ansible kubernetes deployment failed, configure ssh-keygen error")
+                if cluster_tfvars.password:
+                    master_node_name = f"{cluster_tfvars.cluster_name}-k8s-master-1"
+                    ssh_port = hosts_data["_meta"]["hostvars"][master_node_name].get("ansible_port", 22)
+                    cmd = (f'sshpass -p "{cluster_tfvars.password}" ssh-copy-id -o StrictHostKeyChecking=no -p {ssh_port} '
+                        f'{cluster_tfvars.ssh_user}@{master_ip}')
+                    retry_count = 0
+                    max_retries = 30
+                    while retry_count < max_retries:
+                        result = subprocess.run(cmd, shell=True, capture_output=True)
+                        if result.returncode == 0:
+                            break
+                        else:
+                            retry_count += 1
+                            if retry_count < max_retries:
+                                print(f"sshpass failed, retry {retry_count}/{max_retries} after 5s...")
+                                time.sleep(5)
                     if result.returncode != 0:
                         task_info.end_time = datetime.fromtimestamp(datetime.now().timestamp())
                         task_info.state = "failed"
-                        task_info.detail = "Ansible kubernetes deployment failed, configure ssh-keygen error"
+                        task_info.detail = "Ansible kubernetes deployment failed, configure sshpass error"
                         update_task_state(task_info)
-                        raise Exception("Ansible kubernetes deployment failed, configure ssh-keygen error")
-            if cluster_tfvars.password:
-                master_node_name = f"{cluster_tfvars.cluster_name}-k8s-master-1"
-                ssh_port = hosts_data["_meta"]["hostvars"][master_node_name].get("ansible_port", 22)
-                cmd = (f'sshpass -p "{cluster_tfvars.password}" ssh-copy-id -o StrictHostKeyChecking=no -p {ssh_port} '
-                       f'{cluster_tfvars.ssh_user}@{master_ip}')
-                retry_count = 0
-                max_retries = 30
-                while retry_count < max_retries:
-                    result = subprocess.run(cmd, shell=True, capture_output=True)
-                    if result.returncode == 0:
-                        break
-                    else:
-                        retry_count += 1
-                        if retry_count < max_retries:
-                            print(f"sshpass failed, retry {retry_count}/{max_retries} after 5s...")
-                            time.sleep(5)
-                if result.returncode != 0:
-                    task_info.end_time = datetime.fromtimestamp(datetime.now().timestamp())
-                    task_info.state = "failed"
-                    task_info.detail = "Ansible kubernetes deployment failed, configure sshpass error"
-                    update_task_state(task_info)
-                    print(f"sshpass failed after {max_retries} retries: {result.stderr}")
-                    raise Exception("Ansible kubernetes deployment failed, configure sshpass error")
+                        print(f"sshpass failed after {max_retries} retries: {result.stderr}")
+                        raise Exception("Ansible kubernetes deployment failed, configure sshpass error")
 
             extravars["skip_confirmation"] = "true"
             os.environ['CURRENT_CLUSTER_DIR'] = cluster_dir
@@ -2428,3 +2545,261 @@ def install_component(cluster_id, node_name):
         # session.commit()
         # return node.id
         pass
+
+
+def create_kamaji_tenant_control_plane(cluster: ClusterObject, cluster_tfvars: ClusterTFVarsObject) -> bool:
+    """
+    为 hosted_k8s 类型的集群创建 Kamaji TenantControlPlane 资源
+
+    Args:
+        cluster: 集群对象
+        cluster_tfvars: 集群 Terraform 变量对象
+
+    Returns:
+        bool: 创建是否成功
+    """
+    try:
+        # 1. 创建 K8sClient 实例（复用同一个实例）
+        k8s_client = K8sClient(kubeconfig_path=MANAGEMENT_CLUSTER_KUBECONFIG_PATH)
+
+        # 2. 组装 TenantControlPlane YAML
+        tcp_yaml = generate_tenant_control_plane_yaml(cluster, cluster_tfvars)
+
+        # 3. 创建 TenantControlPlane 资源
+        result = k8s_client.create_resource(
+            resource_body=tcp_yaml,
+            resource_type="tenantcontrolplanes",
+            api_version="kamaji.clastix.io/v1alpha1",
+            namespace=cluster.project_id
+        )
+
+        if result:
+            print(f"成功创建 TenantControlPlane: {cluster.name}")
+            return True
+        else:
+            raise Exception("创建 TenantControlPlane 失败")
+
+    except Exception as e:
+        print(f"创建 Kamaji TenantControlPlane 时发生错误: {str(e)}")
+        raise e
+
+def generate_tenant_control_plane_yaml(cluster: ClusterObject, cluster_tfvars: ClusterTFVarsObject) -> Dict[str, Any]:
+    """
+    生成 Kamaji TenantControlPlane 的 YAML 配置
+
+    Args:
+        cluster: 集群对象
+        cluster_tfvars: 集群 Terraform 变量对象
+
+    Returns:
+        Dict[str, Any]: TenantControlPlane 的配置字典
+    """
+    tcp_config = {
+        "apiVersion": "kamaji.clastix.io/v1alpha1",
+        "kind": "TenantControlPlane",
+        "metadata": {
+            "name": f"{cluster.name}-tenant-control-plane",
+            "namespace": cluster.project_id,
+            "labels": {
+                "tenant.clastix.io": cluster.name
+            }
+        },
+        "spec": {
+            "dataStore": "default",
+            "controlPlane": {
+                "deployment": {
+                    "replicas": cluster.kube_info.number_master,
+                    "registrySettings": {
+                        "registry": "registry.cn-hangzhou.aliyuncs.com/google_containers"
+                    },
+                    "extraArgs": {
+                        "apiServer": [],
+                        "controllerManager": [],
+                        "scheduler": []
+                    },
+                    "resources": {}
+                },
+                "service": {
+                    "additionalMetadata": {
+                        "annotations": {
+                            "loadbalancer.openstack.org/floating-network-id": cluster_tfvars.external_net,
+                            "service.beta.kubernetes.io/openstack-internal-load-balancer": "false"
+                        }
+                    },
+                    "serviceType": "LoadBalancer"
+                }
+            },
+            "kubernetes": {
+                "version": cluster.kube_info.version,
+                "kubelet": {
+                    "cgroupfs": "systemd",
+                    "preferredAddressTypes": [
+                        "InternalIP",
+                        "ExternalIP",
+                        "Hostname"
+                    ]
+                },
+                "admissionControllers": [
+                    "ResourceQuota",
+                    "LimitRanger"
+                ]
+            },
+            "networkProfile": {
+                "allowAddressAsExternalIP": True,
+                "clusterDomain": "cluster.local",
+                "port": 6443,
+                "serviceCidr": cluster.kube_info.service_cidr,
+                "podCidr": cluster.kube_info.pod_cidr or "10.233.64.0/18"
+            },
+            "addons": {
+                "coreDNS": {
+                    "imageRepository": "registry.cn-hangzhou.aliyuncs.com/google_containers"
+                },
+                "kubeProxy": {
+                    "imageRepository": "registry.cn-hangzhou.aliyuncs.com/google_containers"
+                },
+                "konnectivity": {
+                    "server": {
+                        "image": "registry.cn-hangzhou.aliyuncs.com/stone-wlg/proxy-server",
+                        "version": "v0.28.6",
+                        "port": 3155,
+                        "resources": {}
+                    },
+                    "agent": {
+                        "image": "registry.cn-hangzhou.aliyuncs.com/stone-wlg/proxy-agent",
+                        "version": "v0.28.6"
+                    }
+                }
+            }
+        }
+    }
+
+    return tcp_config
+
+def get_tenant_control_plane_status(cluster: ClusterObject, timeout: int = 300) -> tuple[bool, Optional[str]]:
+    """
+    等待 TenantControlPlane 准备就绪，并返回控制平面 endpoint
+
+    Args:
+        cluster: 集群对象
+        timeout: 超时时间（秒），默认5分钟
+
+    Returns:
+        tuple[bool, Optional[str]]: (是否准备就绪, 控制平面 endpoint)
+    """
+    try:
+        # 创建 K8sClient 实例（复用同一个实例）
+        k8s_client = K8sClient(kubeconfig_path=MANAGEMENT_CLUSTER_KUBECONFIG_PATH)
+
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                # 查询 TenantControlPlane 状态
+                result = k8s_client.get_resource(
+                    resource_type="tenantcontrolplanes",
+                    api_version="kamaji.clastix.io/v1alpha1",
+                    namespace=cluster.project_id,
+                    name=f"{cluster.name}-tenant-control-plane"
+                )
+
+                if result and 'status' in result:
+                    # 根据实际的状态结构检查
+                    kubernetes_resources = result['status'].get('kubernetesResources', {})
+
+                    # 检查 kubernetesResources.version.status 是否为 Ready
+                    kubernetes_version = kubernetes_resources.get('version', {})
+                    if kubernetes_version and kubernetes_version.get('status') == 'Ready':
+                        # 获取控制平面 endpoint
+                        control_plane_endpoint = result['status'].get('controlPlaneEndpoint')
+                        if control_plane_endpoint:
+                            print(f"TenantControlPlane {cluster.name} 已准备就绪，endpoint: {control_plane_endpoint}")
+                            return True, control_plane_endpoint
+                        else:
+                            print(f"等待 TenantControlPlane {cluster.name} 准备就绪...")
+                            time.sleep(10)
+                            continue
+
+            except Exception as e:
+                if "not found" in str(e).lower():
+                    print(f"TenantControlPlane {cluster.name} 尚未创建，继续等待...")
+                    time.sleep(10)
+                    continue
+                else:
+                    raise e
+
+        raise Exception(f"等待 TenantControlPlane 准备就绪超时 ({timeout}秒)")
+
+    except Exception as e:
+        print(f"等待 TenantControlPlane 准备就绪时发生错误: {str(e)}")
+        raise e
+
+def get_tenant_control_plane_kubeconfig(cluster: ClusterObject) -> Optional[str]:
+    """
+    获取 TenantControlPlane 的 kubeconfig
+
+    Args:
+        cluster: 集群对象
+
+    Returns:
+        Optional[str]: kubeconfig 内容，如果获取失败则返回 None
+    """
+    try:
+        # 创建 K8sClient 实例（复用同一个实例）
+        k8s_client = K8sClient(kubeconfig_path=MANAGEMENT_CLUSTER_KUBECONFIG_PATH)
+
+        # 查询 TenantControlPlane 的 kubeconfig secret
+        # 根据实际状态，secret 名称应该是 admin.conf
+        secret_name = f"{cluster.name}-tenant-control-plane-admin-kubeconfig"
+        result = k8s_client.get_resource(
+            resource_type="secrets",
+            api_version="v1",
+            namespace=cluster.project_id,
+            name=secret_name
+        )
+
+        if result and 'data' in result:
+            # 根据 kubectl 命令，应该使用 'admin.conf' 字段
+            kubeconfig_data = result['data'].get('admin.conf')
+            if kubeconfig_data:
+                import base64
+                kubeconfig_content = base64.b64decode(kubeconfig_data).decode('utf-8')
+                return kubeconfig_content
+
+        raise Exception(f"无法获取 TenantControlPlane 的 kubeconfig secret: {secret_name}")
+
+    except Exception as e:
+        print(f"获取 TenantControlPlane kubeconfig 时发生错误: {str(e)}")
+        return None
+
+def delete_kamaji_tenant_control_plane(tcp_name: str, namespace: str) -> bool:
+    """
+    删除 Kamaji TenantControlPlane 资源
+
+    Args:
+        tcp_name: TenantControlPlane 的名称
+        namespace: 命名空间
+
+    Returns:
+        bool: 删除是否成功
+    """
+    try:
+        # 1. 创建 K8sClient 实例
+        k8s_client = K8sClient(kubeconfig_path=MANAGEMENT_CLUSTER_KUBECONFIG_PATH)
+
+        # 2. 删除 TenantControlPlane 资源
+        result = k8s_client.delete_resource(
+            resource_type="tenantcontrolplanes",
+            api_version="kamaji.clastix.io/v1alpha1",
+            namespace=namespace,
+            name=tcp_name
+        )
+
+        if result:
+            print(f"成功删除 TenantControlPlane: {tcp_name} 在命名空间 {namespace}")
+            return True
+        else:
+            raise Exception(f"删除 TenantControlPlane {tcp_name} 失败")
+
+    except Exception as e:
+        print(f"删除 Kamaji TenantControlPlane 时发生错误: {str(e)}")
+        raise e

@@ -5,5 +5,10 @@
 - name: Calico repos
   import_tasks: repos.yml
 
-- name: Calico install
+- name: Calico install for hosted K8s
+  include_tasks: install_hosted_k8s.yml
+  when: hosted_k8s | default(false)
+
+- name: Calico install for standard K8s
   include_tasks: install.yml
+  when: not (hosted_k8s | default(false))

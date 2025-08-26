@@ -1,0 +1,366 @@
+---
+# 托管版K8s专用Calico安装文件
+# 简化版本，移除不必要的功能，所有操作都在localhost执行
+- name: Calico | Copy calicoctl binary from download dir
+  copy:
+    src: "{{ downloads.calicoctl.dest }}"
+    dest: "{{ bin_dir }}/calicoctl"
+    mode: "0755"
+    remote_src: true
+
+# 0. 检查Calico是否已经安装
+- name: Calico | Check if Calico is already installed
+  shell: "{{ bin_dir }}/kubectl get daemonset calico-node -n kube-system --output=name"
+  register: calico_ds_check
+  ignore_errors: true
+  changed_when: false
+  delegate_to: localhost
+  environment:
+    KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"
+
+# 0.1 创建必要的目录 (只在localhost执行一次)
+- name: Calico | Create base release directory
+  file:
+    path: "{{ local_release_dir }}"
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
+  delegate_to: localhost
+  when: calico_ds_check.stdout == ""
+
+- name: Calico | Create download directory
+  file:
+    path: "{{ local_release_dir }}/calico-{{ calico_version }}-kdd-crds"
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
+  delegate_to: localhost
+  when: calico_ds_check.stdout == ""
+
+- name: Calico | Create extract destination directory
+  file:
+    path: "{{ local_release_dir }}/calico-{{ calico_version }}/libcalico-go/config"
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
+  delegate_to: localhost
+  when: calico_ds_check.stdout == ""
+
+# 1. 下载calicoctl二进制文件
+
+# 1.1 下载Calico CRD源码包 (只在localhost执行一次)
+- name: Calico | Download Calico CRD source package
+  get_url:
+    url: "{{ calico_crds_download_url }}"
+    dest: "{{ local_release_dir }}/calico-{{ calico_version }}-kdd-crds/{{ calico_version }}.tar.gz"
+    # checksum: "{{ calico_crds_archive_checksum }}"
+    owner: root
+    group: root
+  delegate_to: localhost
+  when: calico_ds_check.stdout == ""
+
+# 1.2 解压Calico CRD源码包 (只在localhost执行一次)
+- name: Calico | Extract Calico CRD source package
+  unarchive:
+    src: "{{ local_release_dir }}/calico-{{ calico_version }}-kdd-crds/{{ calico_version }}.tar.gz"
+    dest: "{{ local_release_dir }}/calico-{{ calico_version }}/libcalico-go/config"
+    remote_src: true
+    extra_opts:
+      - "{{ '--strip=6' if (calico_version is version('v3.22.3', '<')) else '--strip=3' }}"
+      - "--wildcards"
+      - "{{ '*/_includes/charts/calico/crds/kdd/' if (calico_version is version('v3.22.3', '<')) else '*/libcalico-go/config/crd/' }}"
+    owner: root
+    create_dirs: yes
+  delegate_to: localhost
+  when: calico_ds_check.stdout == ""
+
+- name: Calico | Create kube config directory
+  file:
+    path: "{{ kube_config_dir }}"
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
+  delegate_to: localhost
+  when: calico_ds_check.stdout == ""
+
+# 2. 创建KDD CRDs (只在localhost执行一次)
+- name: Calico | Create calico manifests for kdd
+  assemble:
+    src: "{{ local_release_dir }}/calico-{{ calico_version }}/libcalico-go/config/crd"
+    dest: "{{ kube_config_dir }}/kdd-crds.yml"
+    mode: "0644"
+    delimiter: "---\n"
+    regexp: ".*\\.yaml"
+    remote_src: true
+  delegate_to: localhost
+  when: calico_ds_check.stdout == ""
+
+# 3. 部署KDD CRDs (只在localhost执行一次)
+- name: Calico | Create Calico Kubernetes datastore resources
+  kube:
+    kubectl: "{{ bin_dir }}/kubectl"
+    filename: "{{ kube_config_dir }}/kdd-crds.yml"
+    state: "latest"
+  register: kubectl_result
+  until: kubectl_result is succeeded
+  retries: 5
+  delegate_to: localhost
+  when: calico_ds_check.stdout == ""
+  environment:
+    KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"
+
+# 4. 安装calicoctl包装脚本
+- name: Calico | Install calicoctl wrapper script
+  template:
+    src: "calicoctl.kdd.sh.j2"
+    dest: "{{ bin_dir }}/calicoctl.sh"
+    mode: "0755"
+    owner: root
+    group: root
+  delegate_to: localhost
+  when: calico_ds_check.stdout == ""
+
+# 5. 创建Calico manifests (只在localhost执行一次)
+- name: Calico | Create calico manifests
+  template:
+    src: "{{ item.file }}.j2"
+    dest: "{{ kube_config_dir }}/{{ item.file }}"
+    mode: "0644"
+  with_items:
+    - {name: calico-config, file: calico-config.yml, type: cm}
+    - {name: calico-node, file: calico-node.yml, type: ds}
+    - {name: calico, file: calico-node-sa.yml, type: sa}
+    - {name: calico, file: calico-cr.yml, type: clusterrole}
+    - {name: calico, file: calico-crb.yml, type: clusterrolebinding}
+    - {name: kubernetes-services-endpoint, file: kubernetes-services-endpoint.yml, type: cm }
+  register: calico_node_manifests
+  delegate_to: localhost
+  when: calico_ds_check.stdout == ""
+
+# 6. 配置Felix (只在localhost执行一次)
+- name: Calico | Configure Felix
+  when: calico_ds_check.stdout == ""
+  block:
+    - name: Calico | Get existing FelixConfiguration
+      command: "{{ bin_dir }}/calicoctl.sh get felixconfig default -o json"
+      register: _felix_cmd
+      ignore_errors: true
+      changed_when: false
+
+    - name: Calico | Set kubespray FelixConfiguration
+      set_fact:
+        _felix_config: >
+          {
+            "kind": "FelixConfiguration",
+            "apiVersion": "projectcalico.org/v3",
+            "metadata": {
+              "name": "default",
+            },
+            "spec": {
+              "ipipEnabled": {{ calico_ipip_mode != 'Never' }},
+              "reportingInterval": "{{ calico_felix_reporting_interval }}",
+              "bpfLogLevel": "{{ calico_bpf_log_level }}",
+              "bpfEnabled": {{ calico_bpf_enabled | bool }},
+              "bpfExternalServiceMode": "{{ calico_bpf_service_mode }}",
+              "wireguardEnabled": {{ calico_wireguard_enabled | bool }},
+              "logSeverityScreen": "{{ calico_felix_log_severity_screen }}",
+              "vxlanEnabled": {{ calico_vxlan_mode != 'Never' }},
+              "featureDetectOverride": "{{ calico_feature_detect_override }}",
+              "floatingIPs": "{{ calico_felix_floating_ips }}"
+            }
+          }
+
+    - name: Calico | Process FelixConfiguration
+      set_fact:
+        _felix_config: "{{ _felix_cmd.stdout | from_json | combine(_felix_config, recursive=True) }}"
+      when:
+        - _felix_cmd is success
+
+    - name: Calico | Configure calico FelixConfiguration
+      command:
+        cmd: "{{ bin_dir }}/calicoctl.sh apply -f -"
+        stdin: "{{ _felix_config is string | ternary(_felix_config, _felix_config | to_json) }}"
+      changed_when: false
+  delegate_to: localhost
+  environment:
+    KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"
+
+# 7. 配置Calico IP Pool (只在localhost执行一次)
+- name: Calico | Configure Calico IP Pool
+  block:
+    - name: Calico | Get existing calico network pool
+      command: "{{ bin_dir }}/calicoctl.sh get ippool {{ calico_pool_name }} -o json"
+      register: _calico_pool_cmd
+      ignore_errors: true
+      changed_when: false
+
+    - name: Calico | Set kubespray calico network pool
+      set_fact:
+        _calico_pool: >
+          {
+            "kind": "IPPool",
+            "apiVersion": "projectcalico.org/v3",
+            "metadata": {
+              "name": "{{ calico_pool_name }}",
+            },
+            "spec": {
+              "blockSize": {{ calico_pool_blocksize }},
+              "cidr": "{{ calico_pool_cidr | default(kube_pods_subnet) }}",
+              "ipipMode": "{{ calico_ipip_mode }}",
+              "vxlanMode": "{{ calico_vxlan_mode }}",
+              "natOutgoing": {{ nat_outgoing | default(false) }}
+            }
+          }
+
+    - name: Calico | Process calico network pool
+      when:
+        - _calico_pool_cmd is success
+      block:
+        - name: Calico | Get current calico network pool blocksize
+          set_fact:
+            _calico_blocksize: >
+              {
+                "spec": {
+                  "blockSize": {{ (_calico_pool_cmd.stdout | from_json).spec.blockSize }}
+                }
+              }
+        - name: Calico | Merge calico network pool
+          set_fact:
+            _calico_pool: "{{ _calico_pool_cmd.stdout | from_json | combine(_calico_pool, _calico_blocksize, recursive=True) }}"
+
+    - name: Calico | Configure calico network pool
+      command:
+        cmd: "{{ bin_dir }}/calicoctl.sh apply -f -"
+        stdin: "{{ _calico_pool is string | ternary(_calico_pool, _calico_pool | to_json) }}"
+      changed_when: false
+  delegate_to: localhost
+  when: calico_ds_check.stdout == ""
+  environment:
+    KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"
+
+# 8. 设置BGP配置所需的变量
+- name: Populate Service External IPs
+  set_fact:
+    _service_external_ips: "{{ _service_external_ips | default([]) + [{'cidr': item}] }}"
+  with_items: "{{ calico_advertise_service_external_ips | default([]) }}"
+  delegate_to: localhost
+  when: calico_ds_check.stdout == ""
+
+- name: Populate Service LoadBalancer IPs
+  set_fact:
+    _service_loadbalancer_ips: "{{ _service_loadbalancer_ips | default([]) + [{'cidr': item}] }}"
+  with_items: "{{ calico_advertise_service_loadbalancer_ips | default([]) }}"
+  delegate_to: localhost
+  when: calico_ds_check.stdout == ""
+
+- name: "Determine nodeToNodeMesh needed state"
+  set_fact:
+    nodeToNodeMeshEnabled: "false"
+  when:
+    - peer_with_router | default(false) or peer_with_calico_rr | default(false)
+    - ('k8s_cluster' in group_names)
+    - calico_ds_check.stdout == ""
+  delegate_to: localhost
+
+# 9. 配置Calico BGP (只在localhost执行一次)
+- name: Calico | Configure Calico BGP
+  block:
+    - name: Calico | Get existing BGP Configuration
+      command: "{{ bin_dir }}/calicoctl.sh get bgpconfig default -o json"
+      register: _bgp_config_cmd
+      ignore_errors: true
+      changed_when: false
+
+    - name: Calico | Set kubespray BGP Configuration
+      set_fact:
+        _bgp_config: >
+          {
+            "kind": "BGPConfiguration",
+            "apiVersion": "projectcalico.org/v3",
+            "metadata": {
+              "name": "default",
+            },
+            "spec": {
+              "listenPort": {{ calico_bgp_listen_port }},
+              "logSeverityScreen": "Info",
+              {% if not calico_no_global_as_num | default(false) %}"asNumber": {{ global_as_num }},{% endif %}
+              "nodeToNodeMeshEnabled": {{ nodeToNodeMeshEnabled | default('true') }} ,
+              {% if calico_advertise_cluster_ips | default(false) %}
+              "serviceClusterIPs": [{"cidr": "{{ kube_service_addresses }}" } {{ ',{"cidr":"' + kube_service_addresses_ipv6 + '"}' if enable_dual_stack_networks else '' }}],{% endif %}
+              {% if calico_advertise_service_loadbalancer_ips | length > 0  %}"serviceLoadBalancerIPs": {{ _service_loadbalancer_ips }},{% endif %}
+              "serviceExternalIPs": {{ _service_external_ips | default([]) }}
+            }
+          }
+
+    - name: Calico | Process BGP Configuration
+      set_fact:
+        _bgp_config: "{{ _bgp_config_cmd.stdout | from_json | combine(_bgp_config, recursive=True) }}"
+      when:
+        - _bgp_config_cmd is success
+
+    - name: Calico | Set up BGP Configuration
+      command:
+        cmd: "{{ bin_dir }}/calicoctl.sh apply -f -"
+        stdin: "{{ _bgp_config is string | ternary(_bgp_config, _bgp_config | to_json) }}"
+      changed_when: false
+  delegate_to: localhost
+  when: calico_ds_check.stdout == ""
+  environment:
+    KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"
+
+# 10. 部署Calico资源 (只在localhost执行一次)
+- name: Start Calico resources
+  kube:
+    name: "{{ item.item.name }}"
+    namespace: "kube-system"
+    kubectl: "{{ bin_dir }}/kubectl"
+    resource: "{{ item.item.type }}"
+    filename: "{{ kube_config_dir }}/{{ item.item.file }}"
+    state: "latest"
+  with_items:
+    - "{{ calico_node_manifests.results }}"
+  when:
+    - not item is skipped
+    - calico_ds_check.stdout == ""
+  loop_control:
+    label: "{{ item.item.file }}"
+  delegate_to: localhost
+  environment:
+    KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"
+
+# 12. 等待Calico kubeconfig创建 (在所有worker节点执行)
+- name: Wait for calico kubeconfig to be created
+  wait_for:
+    path: /etc/cni/net.d/calico-kubeconfig
+    timeout: "{{ calico_kubeconfig_wait_timeout }}"
+  when:
+    - inventory_hostname not in groups['kube_control_plane']
+    - calico_datastore == "kdd"
+
+# 11. 创建IPAM配置 (只在localhost执行一次)
+- name: Calico | Create Calico ipam manifests
+  template:
+    src: "{{ item.file }}.j2"
+    dest: "{{ kube_config_dir }}/{{ item.file }}"
+    mode: "0644"
+  with_items:
+    - {name: calico, file: calico-ipamconfig.yml, type: ipam}
+  delegate_to: localhost
+  when: calico_ds_check.stdout == ""
+
+- name: Calico | Create ipamconfig resources
+  kube:
+    kubectl: "{{ bin_dir }}/kubectl"
+    filename: "{{ kube_config_dir }}/calico-ipamconfig.yml"
+    state: "latest"
+  register: resource_result
+  until: resource_result is succeeded
+  retries: 4
+  delegate_to: localhost
+  when: calico_ds_check.stdout == ""
+  environment:
+    KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"

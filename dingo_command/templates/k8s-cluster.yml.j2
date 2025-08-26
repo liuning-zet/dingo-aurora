@@ -82,7 +82,7 @@ kube_service_addresses: ${service_cidr}
 # internal network. When used, it will assign IP
 # addresses from this range to individual pods.
 # This network must be unused in your network infrastructure!
-kube_pods_subnet: 10.233.64.0/18
+kube_pods_subnet: ${kube_pod_cidr}
 
 # internal network node size allocation (optional). This is the size allocated
 # to each node for pod IP address allocation. Note that the number of pods per node is
@@ -374,3 +374,15 @@ kubeadm_patches: []
 
 # Set to true to remove the role binding to anonymous users created by kubeadm
 remove_anonymous_access: false
+
+# 托管版K8s配置
+hosted_k8s: ${hosted_k8s}
+
+# 外部控制面配置（托管版K8s使用）
+hosted_k8s_apiserver_endpoint: ${hosted_k8s_apiserver_endpoint}
+hosted_k8s_ca_hash: ${hosted_k8s_ca_hash}
+hosted_k8s_join_token: ${hosted_k8s_join_token}
+hosted_k8s_discovery_address: ${hosted_k8s_discovery_address}
+
+# 租户集群kubeconfig配置
+tenant_cluster_kubeconfig: ${tenant_cluster_kubeconfig}

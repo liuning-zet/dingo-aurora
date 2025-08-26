@@ -10,6 +10,7 @@
       {%- endif %}
   tags:
     - facts
+  when: not (hosted_k8s | default(false))
 
 - name: Check if kubelet.conf exists
   stat:
@@ -28,6 +29,7 @@
   register: kubeadm_ca_stat
   delegate_to: "{{ groups['kube_control_plane'][0] }}"
   run_once: true
+  when: not (hosted_k8s | default(false))
 
 - name: Fetch CA certificate from control plane node
   slurp:
@@ -36,6 +38,7 @@
   when:
     - kubeadm_ca_stat.stat is defined
     - kubeadm_ca_stat.stat.exists
+    - not (hosted_k8s | default(false))
   delegate_to: "{{ groups['kube_control_plane'][0] }}"
   run_once: true
 
@@ -43,20 +46,26 @@
   command: "{{ bin_dir }}/kubeadm token create"
   register: temp_token
   delegate_to: "{{ groups['kube_control_plane'][0] }}"
-  when: kubeadm_token is not defined
+  when:
+    - kubeadm_token is not defined
+    - not (hosted_k8s | default(false))
   changed_when: false
 
 - name: Set kubeadm_token to generated token
   set_fact:
     kubeadm_token: "{{ temp_token.stdout }}"
-  when: kubeadm_token is not defined
+  when:
+    - kubeadm_token is not defined
+    - not (hosted_k8s | default(false))
 
 - name: Get kubeconfig for join discovery process
   command: "{{ kubectl }} -n kube-public get cm cluster-info -o jsonpath='{.data.kubeconfig}'"
   register: kubeconfig_file_discovery
   run_once: true
   delegate_to: "{{ groups['kube_control_plane'] | first }}"
-  when: kubeadm_use_file_discovery
+  when:
+    - kubeadm_use_file_discovery
+    - not (hosted_k8s | default(false))
 
 - name: Copy discovery kubeconfig
   copy:
@@ -68,6 +77,7 @@
     - ('kube_control_plane' not in group_names)
     - not kubelet_conf.stat.exists
     - kubeadm_use_file_discovery
+    - not (hosted_k8s | default(false))
 
 - name: Create kubeadm client config
   template:
@@ -76,7 +86,10 @@
     backup: true
     mode: "0640"
     validate: "{{ bin_dir }}/kubeadm config validate --config %s"
-  when: ('kube_control_plane' not in group_names)
+  when:
+    - ('kube_control_plane' not in group_names)
+    - not kubelet_conf.stat.exists
+    - not (hosted_k8s | default(false))
 
 - name: Join to cluster if needed
   environment:
@@ -84,6 +97,7 @@
   when:
     - ('kube_control_plane' not in group_names)
     - not kubelet_conf.stat.exists
+    - not (hosted_k8s | default(false))
   vars:
     ignored:
       - DirAvailable--etc-kubernetes-manifests
@@ -95,6 +109,71 @@
     --ignore-preflight-errors={{ ignored | flatten | join(',') }}
     --skip-phases={{ kubeadm_join_phases_skip | join(',') }}
 
+# 托管版K8s：生成join token和CA hash
+- name: Generate hosted K8s join credentials
+  block:
+    - name: Create kubeadm token and get join command for hosted K8s
+      command: "kubeadm token create --print-join-command --kubeconfig {{ tenant_cluster_kubeconfig }}"
+      register: hosted_k8s_join_command
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Extract token and CA hash from join command
+      set_fact:
+        hosted_k8s_join_token: "{{ hosted_k8s_join_command.stdout | regex_search('--token ([a-zA-Z0-9.]+)', '\\1') | first }}"
+        hosted_k8s_ca_hash: "{{ hosted_k8s_join_command.stdout | regex_search('--discovery-token-ca-cert-hash sha256:([a-zA-Z0-9]+)', '\\1') | first }}"
+      when:
+        - hosted_k8s_join_command.stdout is defined
+        - hosted_k8s_join_command.stdout != ""
+
+- name: Debug hosted K8s variables
+  debug:
+    msg: |
+      === Hosted K8s Variables Debug ===
+      hosted_k8s_join_command.stdout: {{ hosted_k8s_join_command.stdout | default('NOT_DEFINED') }}
+      hosted_k8s_join_token: {{ hosted_k8s_join_token | default('NOT_DEFINED') }}
+      hosted_k8s_ca_hash: {{ hosted_k8s_ca_hash | default('NOT_DEFINED') }}
+      tenant_cluster_kubeconfig: {{ tenant_cluster_kubeconfig | default('NOT_DEFINED') }}
+      hosted_k8s_discovery_address: {{ hosted_k8s_discovery_address | default('NOT_DEFINED') }}
+      hosted_k8s_apiserver_endpoint: {{ hosted_k8s_apiserver_endpoint | default('NOT_DEFINED') }}
+      ================================
+  when:
+    - hosted_k8s | default(false)
+    - not kubelet_conf.stat.exists
+    - tenant_cluster_kubeconfig is defined
+
+# 托管版K8s节点加入逻辑
+- name: Create kubeadm client config for hosted K8s
+  template:
+    src: "kubeadm-client-hosted.conf.j2"
+    dest: "{{ kube_config_dir }}/kubeadm-client-hosted.conf"
+    backup: true
+    mode: "0640"
+    validate: "{{ bin_dir }}/kubeadm config validate --config %s"
+  when:
+    - ('kube_control_plane' not in group_names)
+    - not kubelet_conf.stat.exists
+    - hosted_k8s | default(false)
+
+- name: Join to hosted K8s cluster
+  environment:
+    PATH: "{{ bin_dir }}:{{ ansible_env.PATH }}:/sbin"
+  when:
+    - ('kube_control_plane' not in group_names)
+    - not kubelet_conf.stat.exists
+    - hosted_k8s | default(false)
+  vars:
+    ignored:
+      - DirAvailable--etc-kubernetes-manifests
+      - DirAvailable--var-lib-etcd
+      - "{{ kubeadm_ignore_preflight_errors }}"
+  command: >-
+    timeout -k {{ kubeadm_join_timeout }} {{ kubeadm_join_timeout }}
+    {{ bin_dir }}/kubeadm join
+    --config {{ kube_config_dir }}/kubeadm-client-hosted.conf
+    --ignore-preflight-errors={{ ignored | flatten | join(',') }}
+    --skip-phases={{ kubeadm_join_phases_skip | join(',') }}
+
 - name: Update server field in kubelet kubeconfig
   lineinfile:
     dest: "{{ kube_config_dir }}/kubelet.conf"
@@ -102,6 +181,7 @@
     line: '    server: {{ kube_apiserver_endpoint }}'
     backup: true
   when:
+    - not (hosted_k8s | default(false))
     - kubeadm_config_api_fqdn is not defined
     - ('kube_control_plane' not in group_names)
     - kubeadm_discovery_address != kube_apiserver_endpoint | replace("https://", "")
@@ -115,9 +195,12 @@
     backup: true
   when:
     - ('kube_control_plane' not in group_names)
+    - not (hosted_k8s | default(false))
     - loadbalancer_apiserver is defined
   notify: Kubeadm | restart kubelet
 
+
+# 托管版K8s跳过kube-proxy相关操作
 - name: Get current resourceVersion of kube-proxy configmap
   command: "{{ kubectl }} get configmap kube-proxy -n kube-system -o jsonpath='{.metadata.resourceVersion}'"
   register: original_configmap_resource_version
@@ -126,6 +209,7 @@
   delegate_facts: false
   when:
     - kube_proxy_deployed
+    - not (hosted_k8s | default(false))
   tags:
     - kube-proxy
 
@@ -142,6 +226,7 @@
   delegate_to: "{{ groups['kube_control_plane'] | first }}"
   delegate_facts: false
   when:
+    - not (hosted_k8s | default(false))
     - kubeadm_config_api_fqdn is not defined
     - kubeadm_discovery_address != kube_apiserver_endpoint | replace("https://", "")
     - kube_proxy_deployed
@@ -160,6 +245,7 @@
   delegate_to: "{{ groups['kube_control_plane'] | first }}"
   delegate_facts: false
   when:
+    - not (hosted_k8s | default(false))
     - kube_proxy_deployed
     - loadbalancer_apiserver is defined
   tags:
@@ -173,6 +259,7 @@
   delegate_facts: false
   when:
     - kube_proxy_deployed
+    - not (hosted_k8s | default(false))
   tags:
     - kube-proxy
 
@@ -182,6 +269,7 @@
     owner: root
     group: root
     mode: "0644"
+  when: not (hosted_k8s | default(false))
 
 - name: Restart all kube-proxy pods to ensure that they load the new configmap
   command: "{{ kubectl }} delete pod -n kube-system -l k8s-app=kube-proxy --force --grace-period=0"
@@ -189,6 +277,7 @@
   delegate_to: "{{ groups['kube_control_plane'] | first }}"
   delegate_facts: false
   when:
+    - not (hosted_k8s | default(false))
     - kubeadm_config_api_fqdn is not defined or loadbalancer_apiserver is defined
     - kubeadm_discovery_address != kube_apiserver_endpoint | replace("https://", "") or loadbalancer_apiserver is defined
     - kube_proxy_deployed
@@ -199,6 +288,7 @@
 - name: Extract etcd certs from control plane if using etcd kubeadm mode
   include_tasks: kubeadm_etcd_node.yml
   when:
+    - not (hosted_k8s | default(false))
     - etcd_deployment_type == "kubeadm"
     - inventory_hostname not in groups['kube_control_plane']
     - kube_network_plugin in ["calico", "flannel", "cilium"] or cilium_deploy_additionally | default(false) | bool
