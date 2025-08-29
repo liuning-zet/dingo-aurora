@@ -2,15 +2,11 @@ from typing import Union
 import asyncio
 from datetime import datetime
 import json
-from fastapi import Query, Header, Depends
+from fastapi import Query
 from fastapi import APIRouter, HTTPException, BackgroundTasks
-from dingo_command.api.model.cluster import ScaleNodeObject, NodeRemoveObject
-from dingo_command.api.model.chart import (CreateRepoObject, CreateAppObject, ChartObject, ChartVersionObject,
-                                           ChartMetadataObject, ResponseChartObject)
-from dingo_command.services.cluster import ClusterService, TaskService
-from dingo_command.services.chart import ChartService, create_harbor_repo, create_tag_info, run_sync_repo
-from dingo_command.services.custom_exception import Fail
-from dingo_command.common.nova_client import NovaClient
+from dingo_command.api.model.chart import CreateRepoObject, CreateAppObject
+from dingo_command.services.chart import ChartService, create_harbor_repo, create_tag_info
+from dingo_command.db.models.chart.sql import RepoSQL, AppSQL, ChartSQL, TagSQL
 from dingo_command.utils.helm.util import ChartLOG as Log
 from dingo_command.utils.helm import util
 
@@ -69,9 +65,12 @@ async def list_repos(background_tasks: BackgroundTasks, cluster_id: str = Query(
             query_params['cluster_id'] = cluster_id
         # 显示repo列表的逻辑
         data = chart_service.list_repos(query_params, page, page_size, sort_keys, sort_dirs, display=True)
+        current_time = datetime.now()
         repo_list = []
         for repo in data.get("data"):
             if repo.id == 1 or repo.id == "1" or repo.status != "creating":
+                continue
+            if (current_time - repo.create_time).total_seconds() < util.repo_update_time_out:
                 continue
             repo_data_info = CreateRepoObject(
                 id=str(repo.id),
@@ -87,7 +86,8 @@ async def list_repos(background_tasks: BackgroundTasks, cluster_id: str = Query(
             repo_list.append(repo_data_info)
         if len(repo_list) > 0:
             background_tasks.add_task(chart_service.create_repo_list, repo_list, update=True, status="updating")
-        return data
+        data1 = chart_service.list_repos(query_params, page, page_size, sort_keys, sort_dirs)
+        return data1
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -107,6 +107,16 @@ async def update_repo(repo_id: Union[str, int], repo_data: CreateRepoObject, bac
             raise ValueError("repo not found")
 
         repo = data.get("data")[0]
+        if repo.status == util.repo_status_create:
+            raise ValueError("repo is creating, please wait")
+        if repo.status == util.repo_status_update:
+            raise ValueError("repo is updating, please wait")
+        if repo.status == util.repo_status_sync:
+            raise ValueError("repo is syncing, please wait")
+        if repo.status == util.repo_status_delete:
+            raise ValueError("repo is deleting, please wait")
+        if repo.id == 1 or repo.id == "1":
+            raise ValueError("can not update global repo")
         if repo.url == repo_data.url and repo.name == repo_data.name and repo.type == repo_data.type  and \
                 repo.username == repo_data.username and repo.password == repo_data.password and \
                 repo.description == repo_data.description:
@@ -162,6 +172,17 @@ async def delete_repo(repo_id: Union[str, int], cluster_id: str = Query(None, de
         else:
             data = chart_service.get_repo_from_id(repo_id)
         if data.get("data"):
+            repo = data.get("data")
+            if repo.status == util.repo_status_create:
+                raise ValueError("repo is creating, please wait")
+            if repo.status == util.repo_status_update:
+                raise ValueError("repo is updating, please wait")
+            if repo.status == util.repo_status_sync:
+                raise ValueError("repo is syncing, please wait")
+            if repo.status == util.repo_status_delete:
+                raise ValueError("repo is deleting, please wait")
+            repo.status = util.repo_status_delete
+            RepoSQL.update_repo(repo)
             chart_service.delete_repo_id(data.get("data"))
         return {"success": True, "message": "delete repo success"}
     except Exception as e:
@@ -192,6 +213,13 @@ async def sync_repo(repo_id: Union[str, int], background_tasks: BackgroundTasks)
         repo_data = data.get("data")
         # 先删除原来的repo的charts应用
         data = chart_service.get_repo_from_name(repo_id)
+        repo = data.get("data")[0]
+        if repo.status == util.repo_status_create:
+            raise ValueError("repo is creating, please wait")
+        if repo.status == util.repo_status_update:
+            raise ValueError("repo is updating, please wait")
+        if repo.status == util.repo_status_sync:
+            raise ValueError("repo is syncing, please wait")
         if data.get("data"):
             chart_service.delete_charts_repo_id(data.get("data"))
         # 再添加新的repo的charts应用
@@ -434,6 +462,12 @@ async def put_app(app_id: Union[str, int], update_data: CreateAppObject, backgro
             raise ValueError("app not found")
 
         app_data = data.get("data")[0]
+        if app_data.status == util.app_status_create:
+            raise ValueError("app is creating, please wait")
+        if app_data.status == util.app_status_update:
+            raise ValueError("app is updating, please wait")
+        if app_data.status == util.app_status_delete:
+            raise ValueError("app is deleting, please wait")
         update_data.id = app_data.id
         update_data.name = app_data.name
         update_data.cluster_id = app_data.cluster_id
@@ -480,6 +514,12 @@ async def get_apps(app_id: Union[str, int], background_tasks: BackgroundTasks):
             raise ValueError("app not found")
 
         app_data = data.get("data")[0]
+        if app_data.status == util.app_status_create:
+            raise ValueError("app is creating, please wait")
+        if app_data.status == util.app_status_update:
+            raise ValueError("app is updating, please wait")
+        if app_data.status == util.app_status_delete:
+            raise ValueError("app is deleting, please wait")
         background_tasks.add_task(chart_service.delete_app, app_data)
         return {"success": True, "message": "delete app started, please wait"}
     except Exception as e:
@@ -498,7 +538,7 @@ async def get_apps(create_data: CreateAppObject, background_tasks: BackgroundTas
         data = chart_service.list_apps(query_params, 1, -1, None, None)
         if data.get("total") != 0:
             for app_data in data.get("data"):
-                if app_data.name == create_data.name:
+                if app_data.name == create_data.name and app_data.namespace == create_data.namespace:
                     raise ValueError("app name already exists")
 
         background_tasks.add_task(chart_service.install_app, create_data, update=False)
@@ -508,3 +548,13 @@ async def get_apps(create_data: CreateAppObject, background_tasks: BackgroundTas
         traceback.print_exc()
         Log.error(f"install app {create_data.name} failed, reason: {str(e)}")
         raise HTTPException(status_code=400, detail=f"install app error: {str(e)}")
+
+
+@router.get("/helm/list", summary="安装某个应用（异步）", description="安装某个应用（异步）")
+async def get_test(kube_config_path: str = Query(None, description="kube_config路径")):
+    try:
+        content = chart_service.get_helm_list(kube_config_path)
+        content_list = json.loads(content)
+        return {"data": content_list}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"helm list error: {str(e)}")

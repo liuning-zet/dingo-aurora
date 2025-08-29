@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from dingo_command.db.engines.mysql import get_session
 from dingo_command.db.models.chart.models import RepoInfo, ChartInfo, AppInfo, TagInfo
 from dingo_command.utils.helm.util import ChartLOG as Log
@@ -56,19 +55,7 @@ class RepoSQL:
             start = (page_num - 1) * page_size
             query = query.limit(page_size).offset(start)
             repo_list = query.all()
-            repo_tmp_list = []
-            if "cluster_id" in query_params and query_params["cluster_id"]:
-                for repo in repo_list:
-                    if repo.cluster_id == "all":
-                        if repo.except_cluster:
-                            tmp_list = json.loads(repo.except_cluster)
-                            if query_params["cluster_id"] in tmp_list:
-                                repo.status = "unavailable"
-                    repo_tmp_list.append(repo)
-            if repo_tmp_list:
-                return count, repo_tmp_list
-            else:
-                return count, repo_list
+            return count, repo_list
 
     @classmethod
     def create_repo(cls, repo):
@@ -142,7 +129,8 @@ class ChartSQL:
             if "id" in query_params and query_params["id"]:
                 query = query.filter(ChartInfo.id == query_params["id"])
             if "cluster_id" in query_params and query_params["cluster_id"]:
-                query = query.filter(ChartInfo.cluster_id == query_params["cluster_id"])
+                cluster_ids = [query_params["cluster_id"], "all"]
+                query = query.filter(ChartInfo.cluster_id.in_(cluster_ids))
             if "name" in query_params and query_params["name"]:
                 query = query.filter(ChartInfo.name == query_params["name"])
             if "status" in query_params and query_params["status"]:
@@ -321,8 +309,22 @@ class AppSQL:
     def delete_app_list(cls, app_list):
         # Session = sessionmaker(bind=engine, expire_on_commit=False)
         # session = Session()
-        for app in app_list:
-            cls.delete_app(app)
+        session = get_session()
+        try:
+            app_ids = [app.id for app in app_list]
+            if not app_ids:
+                return
+
+            # 直接执行原生批量删除
+            stmt = delete(AppInfo).where(AppInfo.id.in_(app_ids))
+            with session.begin():
+                session.execute(stmt)
+        except Exception as e:
+            session.rollback()
+            Log.error(f"原生SQL删除失败: {str(e)}")
+            raise
+        finally:
+            session.close()
 
     @classmethod
     def delete_app(cls, app):

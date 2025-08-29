@@ -1,16 +1,12 @@
 import time
 
 import json
-import logging
 import os
-import shutil
 import uuid
 import subprocess
-from io import BytesIO
 import requests
 import shutil
 from requests.auth import HTTPBasicAuth
-from typing import Union
 from datetime import datetime
 from math import ceil
 from openpyxl.styles import Border, Side
@@ -19,8 +15,8 @@ import yaml
 from harborapi import HarborAsyncClient
 import asyncio
 from urllib.parse import urlparse
-from typing import List, Dict
-
+from typing import List
+from httpx import HTTPStatusError
 from dingo_command.api.model.chart import (CreateRepoObject, CreateAppObject, ChartObject, ChartVersionObject,
                                            ChartMetadataObject, ResponseChartObject, ResourcesObject, AppChartObject,
                                            ResponseAppObject)
@@ -34,7 +30,6 @@ from dingo_command.services.cluster import ClusterService
 from dingo_command.services.system import SystemService
 from dingo_command.services import CONF
 from dingo_command.utils.helm import util
-from dingo_command.services.custom_exception import Fail
 from dingo_command.utils.helm.util import ChartLOG as Log
 
 WORK_DIR = CONF.DEFAULT.cluster_work_dir
@@ -45,18 +40,8 @@ harbor_user = CONF.DEFAULT.chart_harbor_user
 harbor_passwd = CONF.DEFAULT.chart_harbor_passwd
 index_yaml = "index.yaml"
 
-
-# 定义边框样式
-thin_border = Border(
-    left=Side(border_style="thin", color="000000"),  # 左边框
-    right=Side(border_style="thin", color="000000"),  # 右边框
-    top=Side(border_style="thin", color="000000"),  # 上边框
-    bottom=Side(border_style="thin", color="000000")  # 下边框
-)
-
-system_service = SystemService()
-
-async def create_harbor_repo(repo_name=util.repo_global_name, url=harbor_url, username=harbor_user, password=harbor_passwd):
+async def create_harbor_repo(repo_name=util.repo_global_name, url=harbor_url, username=harbor_user,
+                             password=harbor_passwd):
     """
     创建Harbor仓库
     :param repo_name: 仓库名称
@@ -69,7 +54,8 @@ async def create_harbor_repo(repo_name=util.repo_global_name, url=harbor_url, us
         data = ChartService().list_repos(query_params, 1, -1, None, None)
         if data.get("total") > 0:
             # 是否要添加当repo的url修改了，重新创建harbor的仓库的charts包
-            if data.get("data")[0].url != url or data.get("data")[0].status == "creating":
+            if (data.get("data")[0].url != url and data.get("data")[0].status == util.repo_status_success or
+                    data.get("data")[0].status == util.repo_status_failed):
                 repo_info_db = data.get("data")[0]
                 repo_info_db.url = url
                 repo_info_db.username = username
@@ -98,11 +84,10 @@ async def create_harbor_repo(repo_name=util.repo_global_name, url=harbor_url, us
         repo_info_db.description = "global repo with harbor"
         repo_info_db.status = "creating"
         RepoSQL.create_repo(repo_info_db)
-
-        service = ChartService()
-        await service.handle_oci_repo(repo_info_db)
-    except asyncio.TimeoutError:
+        await ChartService().handle_oci_repo(repo_info_db)
+    except asyncio.TimeoutError as e:
         Log.error("Harbor API请求超时，请检查网络或Harbor服务状态")
+        raise e
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -158,10 +143,23 @@ class ChartService:
         try:
             # 按照条件从数据库中查询数据
             count, data = RepoSQL.list_repos(query_params, page, page_size, sort_keys, sort_dirs)
+            repo_tmp_list = []
+            if "cluster_id" in query_params and query_params["cluster_id"]:
+                for repo in data:
+                    if repo.cluster_id == "all":
+                        repo.cluster_id = query_params["cluster_id"]
+                        if repo.except_cluster:
+                            tmp_list = json.loads(repo.except_cluster)
+                            if query_params["cluster_id"] in tmp_list:
+                                repo.status = "unavailable"
+                    repo_tmp_list.append(repo)
+            if repo_tmp_list:
+                data = repo_tmp_list
             if count > 0 and not display:
                 for repo in data:
-                    repo.username = "xxxxxxxxxxxxxx"
-                    repo.password = "xxxxxxxxxxxxxx"
+                    if repo.id == 1 or repo.id == "1":
+                        repo.username = "xxxxxxxxxxxxxx"
+                        repo.password = "xxxxxxxxxxxxxx"
             res = {}
             # 页数相关信息
             if page and page_size:
@@ -179,8 +177,25 @@ class ChartService:
     def list_charts(self, query_params, page, page_size, sort_keys, sort_dirs):
         try:
             # 按照条件从数据库中查询数据
+            query_tmp_params = {}
+            query_tmp_params['cluster_id'] = "all"
+            count, data = RepoSQL.list_repos(query_tmp_params, 1, -1, None, None)
+            tmp_list = []
+            if count > 0:
+                repo = data[0]
+                if repo.except_cluster:
+                    tmp_list = json.loads(repo.except_cluster)
             count, data = ChartSQL.list_charts(query_params, page, page_size, sort_keys, sort_dirs)
-
+            chart_tmp_list = []
+            if "cluster_id" in query_params and query_params["cluster_id"]:
+                for chart in data:
+                    if chart.cluster_id == "all":
+                        chart.cluster_id = query_params["cluster_id"]
+                        if query_params["cluster_id"] in tmp_list:
+                            chart.status = "unavailable"
+                    chart_tmp_list.append(chart)
+            if chart_tmp_list:
+                data = chart_tmp_list
             res = {}
             # 页数相关信息
             if page and page_size:
@@ -308,10 +323,10 @@ class ChartService:
             for r in res.get("data"):
                 if r.name == repo.name and r.cluster_id == repo.cluster_id:
                     # 如果查询结果不为空，说明仓库名称已存在+
-                    raise Fail(error_code=405, error_message="Repo name already exists")
-                if r.url == repo.url and r.cluster_id == repo.cluster_id:
-                    # 如果查询结果不为空，说明仓库地址已存在
-                    raise Fail(error_code=405, error_message=f"The same repo url already exists, repo name is {r.name}")
+                    raise ValueError("Repo name already exists")
+                # if r.url == repo.url and r.cluster_id == repo.cluster_id:
+                #     # 如果查询结果不为空，说明仓库地址已存在
+                #     raise ValueError(f"The same repo url already exists, repo name is {r.name}")
 
     def convert_repo_db(self, repo: CreateRepoObject, status="creating"):
         repo_info_db = RepoDB()
@@ -565,66 +580,82 @@ class ChartService:
                 secret=repo_info_db.password
             )
 
-            # 设置3秒超时
-            repositories = await asyncio.wait_for(
-                client.get_repositories(project_name=project_name), timeout=util.time_out
-            )
-            artifact_tasks = []
-            for repository in repositories:
-                # 为每个项目创建异步任务
-                task = asyncio.create_task(
-                    asyncio.wait_for(
-                        client.get_artifacts(project_name=project_name,
-                                             repository_name=repository.name.split(f"{project_name}/")[1],
-                                             with_label=True), timeout=util.repo_time_out)
-                )
-                artifact_tasks.append(task)
+            try_times = 0
+            e_object = None
+            while try_times < util.try_times:
+                try:
+                    repositories = await asyncio.wait_for(
+                        client.get_repositories(project_name=project_name), timeout=util.repo_time_out
+                    )
+                    artifact_tasks = []
+                    for repository in repositories:
+                        # 为每个项目创建异步任务
+                        task = asyncio.create_task(
+                            asyncio.wait_for(
+                                client.get_artifacts(project_name=project_name,
+                                                     repository_name=repository.name.split(f"{project_name}/")[1],
+                                                     with_label=True), timeout=util.repo_time_out)
+                        )
+                        artifact_tasks.append(task)
 
-            # 第三步：并发执行所有制品获取任务
-            chart_list = []
-            await asyncio.gather(*artifact_tasks, return_exceptions=True)
-            for artifact in artifact_tasks:
-                if artifact.result()[0].type != "CHART":
-                    continue
-                dict_version = {}
-                versions = artifact.result()
-                # chartname = versions[0].repository_name.split(f"{project_name}/")[-1]
-                parts = versions[0].repository_name.split('/')
-                chartname = parts[-1]  # 末尾字段
-                prefix_name = '/'.join(parts[parts.index(project_name) + 1: -1])
-                dict_info = versions[0].extra_attrs.model_dump()
-                dict_version["description"] = dict_info.get("description")
-                dict_version["icon"] = dict_info.get("icon")
-                if isinstance(versions[0].push_time, datetime):
-                    dict_version["create_time"] = versions[0].push_time.isoformat()
-                else:
-                    dict_version["create_time"] = versions[0].push_time
-                dict_version["latest_version"] = dict_info.get("version")
-                dict_version["deprecated"] = dict_info.get("deprecated") or False
-                if versions[0].labels:
-                    dict_version["label"] = versions[0].labels[0].name
-                if dict_info.get("keywords"):
-                    dict_version["keywords"] = dict_info.get("keywords")
-                dict_version["version"] = dict()
-                for artifact_info in artifact.result()[:util.chart_nubmer]:
-                    if artifact_info.type != "CHART":
-                        continue
-                    dict_info = {}
-                    dict_tmp_info = artifact_info.addition_links.model_dump()
-                    dict_chart_info = artifact_info.extra_attrs.model_dump()
-                    dict_info["create_time"] = dict_version["create_time"]
-                    dict_info["readme_url"] = harbor_url + dict_tmp_info.get("readme.md").get("href")
-                    dict_info["values_url"] = harbor_url + dict_tmp_info.get("values.yaml").get("href")
-                    dict_version["version"][dict_chart_info.get("version")] = dict_info
+                    chart_list = []
+                    await asyncio.gather(*artifact_tasks, return_exceptions=True)
+                    for artifact in artifact_tasks:
+                        if artifact.result()[0].type != "CHART":
+                            continue
+                        dict_version = {}
+                        versions = artifact.result()
+                        # chartname = versions[0].repository_name.split(f"{project_name}/")[-1]
+                        parts = versions[0].repository_name.split('/')
+                        chartname = parts[-1]  # 末尾字段
+                        prefix_name = '/'.join(parts[parts.index(project_name) + 1: -1])
+                        dict_info = versions[0].extra_attrs.model_dump()
+                        dict_version["description"] = dict_info.get("description")
+                        dict_version["icon"] = dict_info.get("icon")
+                        if isinstance(versions[0].push_time, datetime):
+                            dict_version["create_time"] = versions[0].push_time.isoformat()
+                        else:
+                            dict_version["create_time"] = versions[0].push_time
+                        dict_version["latest_version"] = dict_info.get("version")
+                        dict_version["deprecated"] = dict_info.get("deprecated") or False
+                        if versions[0].labels:
+                            dict_version["label"] = versions[0].labels[0].name
+                        if dict_info.get("keywords"):
+                            dict_version["keywords"] = dict_info.get("keywords")
+                        dict_version["version"] = dict()
+                        for artifact_info in artifact.result()[:util.chart_nubmer]:
+                            if artifact_info.type != "CHART":
+                                continue
+                            dict_info = {}
+                            dict_tmp_info = artifact_info.addition_links.model_dump()
+                            dict_chart_info = artifact_info.extra_attrs.model_dump()
+                            dict_info["create_time"] = dict_version["create_time"]
+                            dict_info["readme_url"] = harbor_url + dict_tmp_info.get("readme.md").get("href")
+                            dict_info["values_url"] = harbor_url + dict_tmp_info.get("values.yaml").get("href")
+                            dict_version["version"][dict_chart_info.get("version")] = dict_info
 
-                chart_info_db = self.convert_db_harbor(chartname, dict_version, repo_info_db, prefix_name)
-                chart_list.append(chart_info_db)
-            ChartSQL.create_chart_list(chart_list)
-            repo_info_db.status = util.repo_status_success
-            repo_info_db.status_msg = ""
-            RepoSQL.update_repo(repo_info_db)
-        except asyncio.TimeoutError:
-            Log.error("Harbor API请求超时，请检查网络或Harbor服务状态")
+                        chart_info_db = self.convert_db_harbor(chartname, dict_version, repo_info_db, prefix_name)
+                        chart_list.append(chart_info_db)
+                    ChartSQL.create_chart_list(chart_list)
+                    repo_info_db.status = util.repo_status_success
+                    repo_info_db.status_msg = ""
+                    RepoSQL.update_repo(repo_info_db)
+                    break
+                except asyncio.TimeoutError as e:
+                    e_object = e
+                    Log.error("Harbor API请求超时，请检查网络或Harbor服务状态")
+                    try_times += 1
+                except HTTPStatusError as e:
+                    e_object = e
+                    Log.error(f"Harbor API请求失败: {e}")
+                    try_times += 1
+                except Exception as e:
+                    e_object = e
+                    Log.error(f"other failed: {e}")
+                    try_times += 1
+            if try_times >= util.try_times:
+                raise ValueError(f"{str(e_object)}")
+
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -848,7 +879,7 @@ class ChartService:
                         chart_readme = chart_file.read()
                     if values_yaml == name:
                         chart_file = tar.extractfile(name)
-                        chart_data = yaml.safe_load(chart_file)
+                        chart_data = json.dumps(yaml.safe_load(chart_file))
             return chart_readme, chart_data
         except Exception as e:
             raise e
@@ -901,7 +932,7 @@ class ChartService:
             # 提取并处理结果
             chart_readme = results[chart_readme_url]
             values_content = results[chart_values_url]
-            index_data = yaml.safe_load(values_content)
+            index_data = json.dumps(yaml.safe_load(values_content))
 
             return chart_readme, index_data
 
@@ -1398,13 +1429,13 @@ class ChartService:
                     # 3、把上述的资源信息和chart信息组装成一个对象返回
                     response_obj = ResponseAppObject(
                         resources=resourc_obj_list,
-                        values=json.loads(app_data.values),
+                        values=app_data.values,
                         chart_info=app_obj
                     )
                 else:
                     response_obj = ResponseAppObject(
                         resources=None,
-                        values=json.loads(app_data.values),
+                        values=app_data.values,
                         chart_info=app_obj
                     )
                 return response_obj
@@ -1413,3 +1444,22 @@ class ChartService:
 
         except Exception as e:
             raise ValueError(f"get app detail error: {str(e)}")
+
+    def get_helm_list(self, kube_config):
+        helm_command = [
+            "helm",
+            "list",
+            "--kubeconfig", kube_config,
+            "-A",
+            "-o", "json"
+        ]
+        # 执行命令并捕获输出
+        result = subprocess.run(
+            helm_command,
+            capture_output=True,
+            text=True
+        )
+        if result.returncode!= 0:
+            raise ValueError(result.stderr)
+
+        return result.stdout

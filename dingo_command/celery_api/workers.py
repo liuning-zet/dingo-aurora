@@ -1044,7 +1044,10 @@ def create_bm_instance(conn, instance_info: InstanceCreateObject, instance_list)
     return server_list
 
 def check_nodes_connectivity(host_file, key_file_path):
+
     """检查所有节点的连通性并返回详细结果"""
+    print(f"config node no password:")
+    
     res={}
     if key_file_path != "":   
         res = subprocess.run([
@@ -1165,6 +1168,7 @@ def update_cluster_node_count(node_count, db_cluster):
 def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_list, scale_nodes=None, scale=False):
     try:
         task_id = self.request.id.__str__()
+        #task_id = "123456789abcdef"  # 测试时使用固定值，实际使用时启用上面一行
         if scale:
             update_task_info(task_id, cluster_dict.get("id"), cluster_dict.get("name"), len(scale_nodes.split(",")))
         print(f"tf: {cluster_tf_dict},cluster_dict: {cluster_dict}")
@@ -1221,15 +1225,26 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
         host_file = os.path.join(WORK_DIR, "ansible-deploy", "inventory", cluster_tf_dict["id"], "hosts")
         os.chmod(host_file, 0o755)  # rwxr-xr-x permission
 
-        # SSH 免密登录配置 - 根据集群类型处理
-        if cluster.type == "kubernetes":
-            master_ip, lb_ip, hosts_data = get_ips(cluster_tfvars, task_info, host_file, cluster_dir)
-            # 清理 known_hosts 中的 master 节点记录
-            if os.path.exists("/root/.ssh/known_hosts"):
-                for i in range(1, cluster_tfvars.number_of_k8s_masters + 1):
-                    print(f"delete host from know_hosts  {task_id}")
-                    master_node_name = f"{cluster_tfvars.cluster_name}-k8s-master-{i}"
-                    tmp_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
+        master_ip, lb_ip, hosts_data = get_ips(cluster_tfvars, task_info, host_file, cluster_dir)
+        # ensure /root/.ssh/known_hosts exists
+        if os.path.exists("/root/.ssh/known_hosts"):
+            for i in range(1, cluster_tfvars.number_of_k8s_masters + 1):
+                print(f"delete host from know_hosts  {task_id}")
+                master_node_name = f"{cluster_tfvars.cluster_name}-k8s-master-{i}"
+                tmp_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
+                cmd = f'ssh-keygen -f "/root/.ssh/known_hosts" -R "{tmp_ip}"'
+                result = subprocess.run(cmd, shell=True, capture_output=True)
+                if result.returncode != 0:
+                    task_info.end_time = datetime.fromtimestamp(datetime.now().timestamp())
+                    task_info.state = "failed"
+                    task_info.detail = "Ansible kubernetes deployment failed, configure ssh-keygen error"
+                    update_task_state(task_info)
+                    raise Exception("Ansible kubernetes deployment failed, configure ssh-keygen error")
+            for i in range(1, len(node_list) + 1):
+                node_name = f"{cluster_tfvars.cluster_name}-node-{i}"
+                # 检查节点是否在hosts_data中存在
+                if "_meta" in hosts_data and "hostvars" in hosts_data["_meta"] and node_name in hosts_data["_meta"]["hostvars"]:
+                    tmp_ip = hosts_data["_meta"]["hostvars"][node_name]["ansible_host"]
                     cmd = f'ssh-keygen -f "/root/.ssh/known_hosts" -R "{tmp_ip}"'
                     result = subprocess.run(cmd, shell=True, capture_output=True)
                     if result.returncode != 0:
@@ -1238,7 +1253,44 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
                         task_info.detail = "Ansible kubernetes deployment failed, configure ssh-keygen error"
                         update_task_state(task_info)
                         raise Exception("Ansible kubernetes deployment failed, configure ssh-keygen error")
-
+        if cluster_tfvars.password != "":
+            for i in range(1, cluster_tfvars.number_of_k8s_masters + 1):
+                master_node_name = f"{cluster_tfvars.cluster_name}-k8s-master-{str(i)}"
+                #ssh_port = hosts_data["_meta"]["hostvars"][master_node_name].get("ansible_port", 22)
+                tmp_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
+                
+                cmd = (f'sshpass -p "{cluster_tfvars.password}" ssh-copy-id -o StrictHostKeyChecking=no -p 22 ' f'{cluster_tfvars.ssh_user}@{tmp_ip}')
+                print(f"config node with password: {cmd} {task_id}")
+                retry_count = 0
+                max_retries = 30
+                while retry_count < max_retries:
+                    result = subprocess.run(cmd, shell=True, capture_output=True)
+                    if result.returncode == 0:
+                        break
+                    else:
+                        retry_count += 1
+                        if retry_count < max_retries:
+                            print(f"sshpass failed, retry {retry_count}/{max_retries} after 5s...")
+                            time.sleep(5)
+            for i in range(1, len(node_list) + 1):
+                node_name = f"{cluster_tfvars.cluster_name}-node-{str(i)}"
+                #ssh_port = hosts_data["_meta"]["hostvars"][master_node_name].get("ansible_port", 22)
+                if "_meta" in hosts_data and "hostvars" in hosts_data["_meta"] and node_name in hosts_data["_meta"]["hostvars"]:
+                    tmp_ip = hosts_data["_meta"]["hostvars"][node_name]["ansible_host"]
+                    cmd = (f'sshpass -p "{cluster_tfvars.password}" ssh-copy-id -o StrictHostKeyChecking=no -p 22 '
+                        f'{cluster_tfvars.ssh_user}@{tmp_ip}')
+                    print(f"config node with password: {cmd} {task_id}")
+                    retry_count = 0
+                    max_retries = 30
+                    while retry_count < max_retries:
+                        result = subprocess.run(cmd, shell=True, capture_output=True)
+                        if result.returncode == 0:
+                            break
+                        else:
+                            retry_count += 1
+                            if retry_count < max_retries:
+                                print(f"sshpass failed, retry {retry_count}/{max_retries} after 5s...")
+                                time.sleep(5)
 
         # 执行ansible命令验证是否能够连接到所有节点
         print(f"check all node status {task_id}")
@@ -1446,6 +1498,10 @@ def get_ips(cluster_tfvars, task_info, host_file, cluster_dir):
         raise Exception("Error generating Ansible inventory")
     hosts = res.stdout
     hosts_data = json.loads(hosts)
+
+    # 如果是 hosted_k8s 类型，返回空值
+    if hasattr(cluster_tfvars, 'type') and cluster_tfvars.type == "hosted_k8s":
+        return "", "", hosts_data
     # 从_meta.hostvars中获取master节点的IP
     master_node_name = cluster_tfvars.cluster_name + "-k8s-master-1"
     master_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
@@ -1847,15 +1903,28 @@ def delete_node(self, cluster_id, cluster_name, node_list, instance_list, extrav
                 cluster_tfvars.number_of_k8s_masters = 0
             cluster_tfvars.ssh_user = content.get("ssh_user")
             cluster_tfvars.password = content.get("password")
+            cluster_tfvars.type = content.get("type")
 
-            if cluster_tfvars.type == "kubernetes":
-                master_ip, lb_ip, hosts_data = get_ips(cluster_tfvars, task_info, host_file, cluster_dir)
-                # ensure /root/.ssh/known_hosts exists
-                if os.path.exists("/root/.ssh/known_hosts"):
-                    for i in range(1, cluster_tfvars.number_of_k8s_masters + 1):
-                        print(f"delete host from know_hosts  {task_id}")
-                        master_node_name = f"{cluster_name}-k8s-master-{i}"
-                        tmp_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
+            master_ip, lb_ip, hosts_data = get_ips(cluster_tfvars, task_info, host_file, cluster_dir)
+
+            if os.path.exists("/root/.ssh/known_hosts"):
+                for i in range(1, cluster_tfvars.number_of_k8s_masters + 1):
+                    print(f"delete host from know_hosts  {task_id}")
+                    master_node_name = f"{cluster_tfvars.cluster_name}-k8s-master-{i}"
+                    tmp_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
+                    cmd = f'ssh-keygen -f "/root/.ssh/known_hosts" -R "{tmp_ip}"'
+                    result = subprocess.run(cmd, shell=True, capture_output=True)
+                    if result.returncode != 0:
+                        task_info.end_time = datetime.fromtimestamp(datetime.now().timestamp())
+                        task_info.state = "failed"
+                        task_info.detail = "Ansible kubernetes deployment failed, configure ssh-keygen error"
+                        update_task_state(task_info)
+                        raise Exception("Ansible kubernetes deployment failed, configure ssh-keygen error")
+                for i in range(1, len(node_list) + 1):
+                    node_name = f"{cluster_tfvars.cluster_name}-node-{i}"
+                    # 检查节点是否在hosts_data中存在
+                    if "_meta" in hosts_data and "hostvars" in hosts_data["_meta"] and node_name in hosts_data["_meta"]["hostvars"]:
+                        tmp_ip = hosts_data["_meta"]["hostvars"][node_name]["ansible_host"]
                         cmd = f'ssh-keygen -f "/root/.ssh/known_hosts" -R "{tmp_ip}"'
                         result = subprocess.run(cmd, shell=True, capture_output=True)
                         if result.returncode != 0:
@@ -1864,11 +1933,14 @@ def delete_node(self, cluster_id, cluster_name, node_list, instance_list, extrav
                             task_info.detail = "Ansible kubernetes deployment failed, configure ssh-keygen error"
                             update_task_state(task_info)
                             raise Exception("Ansible kubernetes deployment failed, configure ssh-keygen error")
-                if cluster_tfvars.password:
-                    master_node_name = f"{cluster_tfvars.cluster_name}-k8s-master-1"
-                    ssh_port = hosts_data["_meta"]["hostvars"][master_node_name].get("ansible_port", 22)
-                    cmd = (f'sshpass -p "{cluster_tfvars.password}" ssh-copy-id -o StrictHostKeyChecking=no -p {ssh_port} '
-                        f'{cluster_tfvars.ssh_user}@{master_ip}')
+            if cluster_tfvars.password != "":
+                for i in range(1, cluster_tfvars.number_of_k8s_masters + 1):
+                    master_node_name = f"{cluster_tfvars.cluster_name}-k8s-master-{str(i)}"
+                    #ssh_port = hosts_data["_meta"]["hostvars"][master_node_name].get("ansible_port", 22)
+                    tmp_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
+                    
+                    cmd = (f'sshpass -p "{cluster_tfvars.password}" ssh-copy-id -o StrictHostKeyChecking=no -p 22 ' f'{cluster_tfvars.ssh_user}@{tmp_ip}')
+                    print(f"config node with password: {cmd} {task_id}")
                     retry_count = 0
                     max_retries = 30
                     while retry_count < max_retries:
@@ -1880,13 +1952,25 @@ def delete_node(self, cluster_id, cluster_name, node_list, instance_list, extrav
                             if retry_count < max_retries:
                                 print(f"sshpass failed, retry {retry_count}/{max_retries} after 5s...")
                                 time.sleep(5)
-                    if result.returncode != 0:
-                        task_info.end_time = datetime.fromtimestamp(datetime.now().timestamp())
-                        task_info.state = "failed"
-                        task_info.detail = "Ansible kubernetes deployment failed, configure sshpass error"
-                        update_task_state(task_info)
-                        print(f"sshpass failed after {max_retries} retries: {result.stderr}")
-                        raise Exception("Ansible kubernetes deployment failed, configure sshpass error")
+                for i in range(1, len(node_list) + 1):
+                    node_name = f"{cluster_tfvars.cluster_name}-node-{str(i)}"
+                    #ssh_port = hosts_data["_meta"]["hostvars"][master_node_name].get("ansible_port", 22)
+                    if "_meta" in hosts_data and "hostvars" in hosts_data["_meta"] and node_name in hosts_data["_meta"]["hostvars"]:
+                        tmp_ip = hosts_data["_meta"]["hostvars"][node_name]["ansible_host"]
+                        cmd = (f'sshpass -p "{cluster_tfvars.password}" ssh-copy-id -o StrictHostKeyChecking=no -p 22 '
+                            f'{cluster_tfvars.ssh_user}@{tmp_ip}')
+                        print(f"config node with password: {cmd} {task_id}")
+                        retry_count = 0
+                        max_retries = 30
+                        while retry_count < max_retries:
+                            result = subprocess.run(cmd, shell=True, capture_output=True)
+                            if result.returncode == 0:
+                                break
+                            else:
+                                retry_count += 1
+                                if retry_count < max_retries:
+                                    print(f"sshpass failed, retry {retry_count}/{max_retries} after 5s...")
+                                    time.sleep(5)
 
             extravars["skip_confirmation"] = "true"
             os.environ['CURRENT_CLUSTER_DIR'] = cluster_dir
