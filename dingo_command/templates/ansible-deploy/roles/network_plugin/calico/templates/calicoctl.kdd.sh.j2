@@ -1,10 +1,12 @@
 #!/bin/bash
 DATASTORE_TYPE=kubernetes \
-{% if hosted_k8s | default(false) %}
+{% if is_delegated_task | default(false) %}
 KUBECONFIG="{{ tenant_cluster_kubeconfig }}" \
-{% elif inventory_hostname in groups['kube_control_plane'] %}
+{{ local_bin_dir }}/{{ calico_version }}/calicoctl --allow-version-mismatch "$@"
+{% elif 'kube_control_plane' in group_names %}
 KUBECONFIG=/etc/kubernetes/admin.conf \
+{{ bin_dir }}/calicoctl --allow-version-mismatch "$@"
 {% else %}
 KUBECONFIG=/etc/cni/net.d/calico-kubeconfig \
-{% endif %}
 {{ bin_dir }}/calicoctl --allow-version-mismatch "$@"
+{% endif %}

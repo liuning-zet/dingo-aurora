@@ -15,9 +15,7 @@
 
 # 托管版K8s：检查集群连接性
 - name: Hosted K8s | Check cluster connectivity
-  command: "{{ kubectl }} get nodes --request-timeout=10s"
-  environment:
-    KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"
+  command: "{{ local_bin_dir }}/{{ kube_version }}/kubectl --kubeconfig {{ tenant_cluster_kubeconfig }} get nodes --request-timeout=10s"
   register: result
   until: result.rc == 0
   retries: 10
@@ -68,10 +66,8 @@
 # 托管版K8s：在本地执行节点设置标签
 - name: Set label to node (Hosted K8s)
   command: >-
-      {{ kubectl }} label node {% if kube_override_hostname %}{{ kube_override_hostname }}{% else %}{{ inventory_hostname }}{% endif %} {{ item }} --overwrite=true
+      {{ local_bin_dir }}/{{ kube_version }}/kubectl --kubeconfig {{ tenant_cluster_kubeconfig }} label node {% if kube_override_hostname %}{{ kube_override_hostname }}{% else %}{{ inventory_hostname }}{% endif %} {{ item }} --overwrite=true
   loop: "{{ role_node_labels + inventory_node_labels }}"
-  environment:
-    KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"
   delegate_to: localhost
   changed_when: false
   when:

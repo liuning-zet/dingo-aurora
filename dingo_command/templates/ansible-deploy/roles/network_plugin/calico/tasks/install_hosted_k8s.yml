@@ -10,7 +10,7 @@
 
 # 0. 检查Calico是否已经安装
 - name: Calico | Check if Calico is already installed
-  shell: "{{ bin_dir }}/kubectl get daemonset calico-node -n kube-system --output=name"
+  shell: "{{ local_bin_dir }}/{{ kube_version }}/kubectl get daemonset calico-node -n kube-system --output=name"
   register: calico_ds_check
   ignore_errors: true
   changed_when: false
@@ -49,8 +49,6 @@
   delegate_to: localhost
   when: calico_ds_check.stdout == ""
 
-# 1. 下载calicoctl二进制文件
-
 # 1.1 下载Calico CRD源码包 (只在localhost执行一次)
 - name: Calico | Download Calico CRD source package
   get_url:
@@ -73,7 +71,6 @@
       - "--wildcards"
       - "{{ '*/_includes/charts/calico/crds/kdd/' if (calico_version is version('v3.22.3', '<')) else '*/libcalico-go/config/crd/' }}"
     owner: root
-    create_dirs: yes
   delegate_to: localhost
   when: calico_ds_check.stdout == ""
 
@@ -102,7 +99,7 @@
 # 3. 部署KDD CRDs (只在localhost执行一次)
 - name: Calico | Create Calico Kubernetes datastore resources
   kube:
-    kubectl: "{{ bin_dir }}/kubectl"
+    kubectl: "{{ local_bin_dir }}/{{ kube_version }}/kubectl"
     filename: "{{ kube_config_dir }}/kdd-crds.yml"
     state: "latest"
   register: kubectl_result
@@ -114,15 +111,29 @@
     KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"
 
 # 4. 安装calicoctl包装脚本
-- name: Calico | Install calicoctl wrapper script
+# 在localhost上安装calicoctl wrapper script
+- name: Calico | Install calicoctl wrapper script on localhost
+  template:
+    src: "calicoctl.kdd.sh.j2"
+    dest: "{{ local_bin_dir }}/{{ calico_version }}/calicoctl.sh"
+    mode: "0755"
+    owner: root
+    group: root
+  delegate_to: localhost
+  vars:
+    is_delegated_task: true
+  when: calico_ds_check.stdout == ""
+
+# 在工作节点上安装calicoctl wrapper script
+- name: Calico | Install calicoctl wrapper script on worker nodes
   template:
     src: "calicoctl.kdd.sh.j2"
     dest: "{{ bin_dir }}/calicoctl.sh"
     mode: "0755"
     owner: root
     group: root
-  delegate_to: localhost
-  when: calico_ds_check.stdout == ""
+  when:
+    - inventory_hostname in groups['kube_node']
 
 # 5. 创建Calico manifests (只在localhost执行一次)
 - name: Calico | Create calico manifests
@@ -146,7 +157,7 @@
   when: calico_ds_check.stdout == ""
   block:
     - name: Calico | Get existing FelixConfiguration
-      command: "{{ bin_dir }}/calicoctl.sh get felixconfig default -o json"
+      command: "{{ local_bin_dir }}/{{ calico_version }}/calicoctl.sh get felixconfig default -o json"
       register: _felix_cmd
       ignore_errors: true
       changed_when: false
@@ -182,7 +193,7 @@
 
     - name: Calico | Configure calico FelixConfiguration
       command:
-        cmd: "{{ bin_dir }}/calicoctl.sh apply -f -"
+        cmd: "{{ local_bin_dir }}/{{ calico_version }}/calicoctl.sh apply -f -"
         stdin: "{{ _felix_config is string | ternary(_felix_config, _felix_config | to_json) }}"
       changed_when: false
   delegate_to: localhost
@@ -193,7 +204,7 @@
 - name: Calico | Configure Calico IP Pool
   block:
     - name: Calico | Get existing calico network pool
-      command: "{{ bin_dir }}/calicoctl.sh get ippool {{ calico_pool_name }} -o json"
+      command: "{{ local_bin_dir }}/{{ calico_version }}/calicoctl.sh get ippool {{ calico_pool_name }} -o json"
       register: _calico_pool_cmd
       ignore_errors: true
       changed_when: false
@@ -234,7 +245,7 @@
 
     - name: Calico | Configure calico network pool
       command:
-        cmd: "{{ bin_dir }}/calicoctl.sh apply -f -"
+        cmd: "{{ local_bin_dir }}/{{ calico_version }}/calicoctl.sh apply -f -"
         stdin: "{{ _calico_pool is string | ternary(_calico_pool, _calico_pool | to_json) }}"
       changed_when: false
   delegate_to: localhost
@@ -270,7 +281,7 @@
 - name: Calico | Configure Calico BGP
   block:
     - name: Calico | Get existing BGP Configuration
-      command: "{{ bin_dir }}/calicoctl.sh get bgpconfig default -o json"
+      command: "{{ local_bin_dir }}/{{ calico_version }}/calicoctl.sh get bgpconfig default -o json"
       register: _bgp_config_cmd
       ignore_errors: true
       changed_when: false
@@ -304,7 +315,7 @@
 
     - name: Calico | Set up BGP Configuration
       command:
-        cmd: "{{ bin_dir }}/calicoctl.sh apply -f -"
+        cmd: "{{ local_bin_dir }}/{{ calico_version }}/calicoctl.sh apply -f -"
         stdin: "{{ _bgp_config is string | ternary(_bgp_config, _bgp_config | to_json) }}"
       changed_when: false
   delegate_to: localhost
@@ -317,7 +328,7 @@
   kube:
     name: "{{ item.item.name }}"
     namespace: "kube-system"
-    kubectl: "{{ bin_dir }}/kubectl"
+    kubectl: "{{ local_bin_dir }}/{{ kube_version }}/kubectl"
     resource: "{{ item.item.type }}"
     filename: "{{ kube_config_dir }}/{{ item.item.file }}"
     state: "latest"
@@ -332,14 +343,6 @@
   environment:
     KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"
 
-# 12. 等待Calico kubeconfig创建 (在所有worker节点执行)
-- name: Wait for calico kubeconfig to be created
-  wait_for:
-    path: /etc/cni/net.d/calico-kubeconfig
-    timeout: "{{ calico_kubeconfig_wait_timeout }}"
-  when:
-    - inventory_hostname not in groups['kube_control_plane']
-    - calico_datastore == "kdd"
 
 # 11. 创建IPAM配置 (只在localhost执行一次)
 - name: Calico | Create Calico ipam manifests
@@ -354,7 +357,7 @@
 
 - name: Calico | Create ipamconfig resources
   kube:
-    kubectl: "{{ bin_dir }}/kubectl"
+    kubectl: "{{ local_bin_dir }}/{{ kube_version }}/kubectl"
     filename: "{{ kube_config_dir }}/calico-ipamconfig.yml"
     state: "latest"
   register: resource_result
@@ -364,3 +367,12 @@
   when: calico_ds_check.stdout == ""
   environment:
     KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"
+
+# 12. 等待Calico kubeconfig创建 (在所有worker节点执行)
+- name: Wait for calico kubeconfig to be created
+  wait_for:
+    path: /etc/cni/net.d/calico-kubeconfig
+    timeout: "{{ calico_kubeconfig_wait_timeout }}"
+  when:
+    - ('kube_control_plane' not in group_names)
+    - calico_datastore == "kdd"

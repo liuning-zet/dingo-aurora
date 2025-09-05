@@ -1,0 +1,69 @@
+- name: Create binary directory
+  file:
+    path: "{{ local_bin_dir }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  run_once: true
+
+- name: Create version directories
+  file:
+    path: "{{ local_bin_dir }}/{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ kube_version }}"
+    - "{{ calico_version }}"
+  delegate_to: localhost
+  run_once: true
+
+# 下载kubectl
+- name: Check if kubectl exists
+  stat:
+    path: "{{ local_bin_dir }}/{{ kube_version }}/kubectl"
+  register: kubectl_stat
+  delegate_to: localhost
+  run_once: true
+
+- name: Download kubectl {{ kube_version }}
+  get_url:
+    url: "{{ kubectl_download_url }}"
+    dest: "{{ local_bin_dir }}/{{ kube_version }}/kubectl"
+    mode: "0755"
+  when: not kubectl_stat.stat.exists
+  delegate_to: localhost
+  run_once: true
+
+# 下载kubeadm
+- name: Check if kubeadm exists
+  stat:
+    path: "{{ local_bin_dir }}/{{ kube_version }}/kubeadm"
+  register: kubeadm_stat
+  delegate_to: localhost
+  run_once: true
+
+- name: Download kubeadm {{ kube_version }}
+  get_url:
+    url: "{{ kubeadm_download_url }}"
+    dest: "{{ local_bin_dir }}/{{ kube_version }}/kubeadm"
+    mode: "0755"
+  when: not kubeadm_stat.stat.exists
+  delegate_to: localhost
+  run_once: true
+
+# 下载calicoctl
+- name: Check if calicoctl exists
+  stat:
+    path: "{{ local_bin_dir }}/{{ calico_version }}/calicoctl"
+  register: calicoctl_stat
+  delegate_to: localhost
+  run_once: true
+
+- name: Download calicoctl {{ calico_version }}
+  get_url:
+    url: "{{ calicoctl_download_url }}"
+    dest: "{{ local_bin_dir }}/{{ calico_version }}/calicoctl"
+    mode: "0755"
+  when: not calicoctl_stat.stat.exists
+  delegate_to: localhost
+  run_once: true

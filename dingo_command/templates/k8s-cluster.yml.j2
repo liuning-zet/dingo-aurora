@@ -380,9 +380,10 @@ hosted_k8s: ${hosted_k8s}
 
 # 外部控制面配置（托管版K8s使用）
 hosted_k8s_apiserver_endpoint: ${hosted_k8s_apiserver_endpoint}
-hosted_k8s_ca_hash: ${hosted_k8s_ca_hash}
-hosted_k8s_join_token: ${hosted_k8s_join_token}
 hosted_k8s_discovery_address: ${hosted_k8s_discovery_address}
 
 # 租户集群kubeconfig配置
 tenant_cluster_kubeconfig: ${tenant_cluster_kubeconfig}
+
+# kubectl kubeadm calicoctl 在本地存储路径
+local_bin_dir: ${local_bin_dir}

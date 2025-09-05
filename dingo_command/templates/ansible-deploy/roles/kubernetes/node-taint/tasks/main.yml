@@ -38,13 +38,10 @@
 # 托管版K8s：在本地执行节点设置污点
 - name: Set taint to node (Hosted K8s)
   command: >-
-      {{ kubectl }} taint node {{ kube_override_hostname | default(inventory_hostname) }} {{ (role_node_taints + inventory_node_taints) | join(' ') }} --overwrite=true
-  environment:
-    KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"
+      {{ local_bin_dir }}/{{ kube_version }}/kubectl --kubeconfig {{ tenant_cluster_kubeconfig }} taint node {{ kube_override_hostname | default(inventory_hostname) }} {{ (role_node_taints + inventory_node_taints) | join(' ') }} --overwrite=true
   delegate_to: localhost
   changed_when: false
   when:
     - hosted_k8s | default(false)
     - tenant_cluster_kubeconfig is defined
     - (role_node_taints + inventory_node_taints) | length > 0
-

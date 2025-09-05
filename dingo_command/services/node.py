@@ -456,6 +456,7 @@ class NodeService:
             password = content.get("password")
             forward_float_ip_id = content.get("forward_float_ip_id")
             lb_enbale = content.get("k8s_master_loadbalancer_enabled")
+            number_of_k8s_masters = content.get("number_of_k8s_masters")
             number_of_k8s_masters_no_floating_ip = content.get("number_of_k8s_masters_no_floating_ip")
             neutron_api = neutron.API()  # 创建API类的实例
             external_net = neutron_api.list_external_networks()
@@ -484,7 +485,7 @@ class NodeService:
                 use_existing_network=False,
                 ssh_user=ssh_user,
                 k8s_master_loadbalancer_enabled=lb_enbale,
-                number_of_k8s_masters=1,
+                number_of_k8s_masters= number_of_k8s_masters,
                 number_of_k8s_masters_no_floating_ip=number_of_k8s_masters_no_floating_ip,
                 token=token,
                 auth_url=auth_url,

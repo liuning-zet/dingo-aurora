@@ -12,18 +12,6 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends apt-utils \
     gcc traceroute lsof iputils-ping vim wget curl locales-all\
     python3-pip cmake build-essential python3-dev libxml2-dev supervisor gnupg software-properties-common sshpass
 
-# 安装kubectl
-RUN curl -LO "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
-    && chmod +x kubectl \
-    && mv kubectl /usr/local/bin/ \
-    && kubectl version --client
-
-# 安装kubeadm
-RUN curl -LO "https://dl.k8s.io/release/v${KUBEADM_VERSION}/bin/linux/amd64/kubeadm" \
-    && chmod +x kubeadm \
-    && mv kubeadm /usr/local/bin/ \
-    && kubeadm version
-
 RUN wget https://get.helm.sh/helm-v3.18.4-linux-amd64.tar.gz -O /tmp/helm.tar.gz && \
     tar -zxvf /tmp/helm.tar.gz -C /tmp && \
     mv /tmp/linux-amd64/helm /usr/local/bin/helm && \

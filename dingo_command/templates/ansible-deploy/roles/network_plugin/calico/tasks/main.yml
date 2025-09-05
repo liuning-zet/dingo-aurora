@@ -9,6 +9,6 @@
   include_tasks: install_hosted_k8s.yml
   when: hosted_k8s | default(false)
 
-- name: Calico install for standard K8s
+- name: Calico install
   include_tasks: install.yml
   when: not (hosted_k8s | default(false))

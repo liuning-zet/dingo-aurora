@@ -3,8 +3,8 @@
   command: "{{ kubectl }} delete node {{ kube_override_hostname | default(inventory_hostname) }}"
   delegate_to: "{{ groups['kube_control_plane'] | first }}"
   when:
+    - not hosted_k8s | default(false)
     - groups['kube_control_plane'] | length > 0
-    - not (hosted_k8s | default(false))
     # ignore servers that are not nodes
     - ('k8s_cluster' in group_names) and kube_override_hostname | default(inventory_hostname) in nodes.stdout_lines
   retries: "{{ delete_node_retries }}"
@@ -14,7 +14,7 @@
   until: result is not failed
 
 - name: Remove-node | Delete node (hosted_k8s)
-  command: "{{ kubectl }} --kubeconfig {{ tenant_cluster_kubeconfig }} delete node {{ kube_override_hostname | default(inventory_hostname) }}"
+  command: "{{ local_bin_dir }}/{{ kube_version }}/kubectl --kubeconfig {{ tenant_cluster_kubeconfig }} delete node {{ kube_override_hostname | default(inventory_hostname) }}"
   delegate_to: localhost
   when:
     - hosted_k8s | default(false)

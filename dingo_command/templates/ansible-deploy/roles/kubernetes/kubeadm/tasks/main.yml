@@ -113,7 +113,7 @@
 - name: Generate hosted K8s join credentials
   block:
     - name: Create kubeadm token and get join command for hosted K8s
-      command: "kubeadm token create --print-join-command --kubeconfig {{ tenant_cluster_kubeconfig }}"
+      command: "{{ local_bin_dir }}/{{ kube_version }}/kubeadm token create --print-join-command --kubeconfig {{ tenant_cluster_kubeconfig }}"
       register: hosted_k8s_join_command
       delegate_to: localhost
       changed_when: false
@@ -125,22 +125,6 @@
       when:
         - hosted_k8s_join_command.stdout is defined
         - hosted_k8s_join_command.stdout != ""
-
-- name: Debug hosted K8s variables
-  debug:
-    msg: |
-      === Hosted K8s Variables Debug ===
-      hosted_k8s_join_command.stdout: {{ hosted_k8s_join_command.stdout | default('NOT_DEFINED') }}
-      hosted_k8s_join_token: {{ hosted_k8s_join_token | default('NOT_DEFINED') }}
-      hosted_k8s_ca_hash: {{ hosted_k8s_ca_hash | default('NOT_DEFINED') }}
-      tenant_cluster_kubeconfig: {{ tenant_cluster_kubeconfig | default('NOT_DEFINED') }}
-      hosted_k8s_discovery_address: {{ hosted_k8s_discovery_address | default('NOT_DEFINED') }}
-      hosted_k8s_apiserver_endpoint: {{ hosted_k8s_apiserver_endpoint | default('NOT_DEFINED') }}
-      ================================
-  when:
-    - hosted_k8s | default(false)
-    - not kubelet_conf.stat.exists
-    - tenant_cluster_kubeconfig is defined
 
 # 托管版K8s节点加入逻辑
 - name: Create kubeadm client config for hosted K8s

@@ -41,16 +41,21 @@
 
 # 1. 检查calico-kube-controllers是否已经安装
 - name: Calico | Check if calico-kube-controllers is already installed
-  shell: "{{ bin_dir }}/kubectl get deployment calico-kube-controllers -n kube-system --output=name"
+  shell: "{{ local_bin_dir }}/{{ kube_version }}/kubectl --kubeconfig {{ tenant_cluster_kubeconfig }} get deployment calico-kube-controllers -n kube-system --output=name"
   register: calico_kube_controller_check
   ignore_errors: true
   changed_when: false
   delegate_to: localhost
   when: hosted_k8s
-  environment:
-    KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"
 
 # 2. 创建calico-kube-controllers manifests (只在localhost执行一次)
+- name: Create kube config directory
+  file:
+    path: "{{ kube_config_dir }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+
 - name: Calico | Create calico-kube-controllers manifests
   template:
     src: "{{ item.file }}.j2"
@@ -73,7 +78,7 @@
   kube:
     name: "{{ item.item.name }}"
     namespace: "kube-system"
-    kubectl: "{{ bin_dir }}/kubectl"
+    kubectl: "{{ local_bin_dir }}/{{ kube_version }}/kubectl"
     resource: "{{ item.item.type }}"
     filename: "{{ kube_config_dir }}/{{ item.item.file }}"
     state: "latest"
