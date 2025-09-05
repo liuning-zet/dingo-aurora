@@ -30,6 +30,7 @@ default_opts = [
     cfg.StrOpt('pushgateway_pass', default="", help='the cluster router id'),
     cfg.ListOpt('customize_hosts', default=[], help='the cluster router id'),
     cfg.ListOpt('nameservers', default=[], help='the cluster router id'),
+    cfg.StrOpt('kubeconfig_path', default="/etc/dingo-command/management.kubeconfig", help='management cluster kubeconfig'),
 ]
 
 CONF.register_group(default_group)

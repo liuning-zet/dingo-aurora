@@ -1068,6 +1068,14 @@ class TaskService:
         worker_deploy = "配置kubernetes工作节点"
         component_deploy = "安装组件"
 
+    class TaskHostedK8sMessage(Enum):
+        instructure_create = "创建基础设施"
+        pre_install = "安装前准备"
+        # 去掉 runtime_prepair 和 etcd_deploy
+        controller_deploy = "配置kubernetes控制面"
+        worker_deploy = "配置kubernetes工作节点"
+        component_deploy = "安装组件"
+
     class TaskBaremetalMessage(Enum):
         instructure_create = "创建基础设施"
 
@@ -1149,6 +1157,8 @@ class TaskService:
         else:
 
             for task in TaskService.TaskMessage:
+                if (task.name == 'etcd_deploy' or task.name == 'runtime_prepair') and type == 'hosted_k8s':
+                    continue
                 task_dict = {
                     'msg': task.name,
                     'state': "waiting",
@@ -1215,8 +1225,10 @@ class TaskService:
             tasks = res[1]
             if cluster.type == "baremetal":
                 tasks_with_title = self.handle_task(tasks, TaskService.TaskBaremetalMessage, tasks_with_title)
-            elif cluster.type in ("kubernetes", "hosted_k8s"):
+            elif cluster.type == "kubernetes":
                 tasks_with_title = self.handle_task(tasks, TaskService.TaskMessage, tasks_with_title)
+            elif cluster.type == "hosted_k8s":
+                tasks_with_title = self.handle_task(tasks, TaskService.TaskHostedK8sMessage, tasks_with_title)
             else:
                 pass
             return tasks_with_title

@@ -68,13 +68,13 @@ image_master_id = ServiceConf.DEFAULT.k8s_master_image
 k8s_master_flavor = ServiceConf.DEFAULT.k8s_master_flavor
 
 # 管理集群配置
-MANAGEMENT_CLUSTER_KUBECONFIG_PATH = CONF.DEFAULT.get("management_cluster.kubeconfig_path", "/home/dingo-command/kubeconfig/management_cluster")
+MANAGEMENT_CLUSTER_KUBECONFIG_PATH = CONF.DEFAULT.kubeconfig_path
 
 runtime_task_name = "Check container-engine status"
 etcd_task_name = "Check etcd cluster status"
 control_plane_task_name = "Check control plane status"
 work_node_task_name = "Check k8s nodes status"
-
+hosted_k8s_worker_task_name = "Target only workers to get kubelet installed and checking in on any new nodes(network)"
 # scale_swap = "Disable swap"
 # scale_stop_kubelet = "Stop kubelet"
 scale_install_crictl = "Install crictl"
@@ -461,13 +461,6 @@ def create_cluster(self, cluster_tf, cluster_dict, instance_bm_list, scale=False
 
 def deploy_kubernetes(cluster: ClusterObject, lb_ip: str, task_id: str = None):
     """使用Ansible部署K8s集群"""
-    runtime_task = Taskinfo(task_id=task_id, cluster_id=cluster.id, state="progress",
-                         start_time=datetime.fromtimestamp(datetime.now().timestamp()),
-                         msg=TaskService.TaskMessage.runtime_prepair.name)
-    etcd_task = Taskinfo(task_id=task_id)
-    control_plane_task = Taskinfo(task_id=task_id)
-    worker_task = Taskinfo(task_id=task_id)
-    component_task = Taskinfo(task_id=task_id)
     try:
         # #替换
         # # 定义上下文字典，包含所有要替换的变量值
@@ -487,31 +480,45 @@ def deploy_kubernetes(cluster: ClusterObject, lb_ip: str, task_id: str = None):
             'kube_version': cluster.kube_info.version,
             'kube_network_plugin': cluster.kube_info.cni,
             'service_cidr': cluster.kube_info.service_cidr,
-            "kube_vip_address": lb_ip,
-            "kube_proxy_mode": cluster.kube_info.kube_proxy_mode,
-            "container_manager": cluster.kube_info.runtime,
-            "custom_hosts": CUSTOM_HOSTS,
-            "nameservers": NAMESERVERS,
-            "kube_pod_cidr": cluster.kube_info.pod_cidr or "10.233.64.0/18",
+            'kube_vip_address': lb_ip,
+            'kube_proxy_mode': cluster.kube_info.kube_proxy_mode,
+            'container_manager': cluster.kube_info.runtime,
+            'custom_hosts': CUSTOM_HOSTS,
+            'nameservers': NAMESERVERS,
+            'kube_pod_cidr': cluster.kube_info.pod_cidr or '10.233.64.0/18',
+            'hosted_k8s': cluster.type == 'hosted_k8s',
+            'hosted_k8s_apiserver_endpoint': f'https://{lb_ip}:6443' if cluster.type == 'hosted_k8s' and lb_ip else '',
+            'hosted_k8s_discovery_address': f'{lb_ip}:6443' if cluster.type == 'hosted_k8s' and lb_ip else '',
+            'tenant_cluster_kubeconfig': os.path.join(WORK_DIR, 'ansible-deploy', 'inventory', str(cluster.id), 'tenant-cluster-kubeconfig') if cluster.type == 'hosted_k8s' else '',
+            'local_bin_dir': os.path.join(WORK_DIR, 'ansible-deploy', 'local_bin') if cluster.type == 'hosted_k8s' else '',
         }
-        # 如果是托管版K8s，添加额外配置
-        if cluster.type == "hosted_k8s":
-            context.update({
-                'hosted_k8s': True,
-                'hosted_k8s_apiserver_endpoint': lb_ip + ":6443",
-                'hosted_k8s_ca_hash': "",
-                'hosted_k8s_join_token': "",
-                'tenant_cluster_kubeconfig': os.path.join(WORK_DIR, "ansible-deploy", "inventory", str(cluster.id), "tenant-cluster-kubeconfig"),
-            })
+
         target_dir = os.path.join(WORK_DIR, "ansible-deploy", "inventory", str(cluster.id), "group_vars", "k8s_cluster")
         os.makedirs(target_dir, exist_ok=True)
         cluster_file = os.path.join(target_dir, "k8s-cluster.yml")
         render_templatefile(template_file, cluster_file, context)
 
         # 将templates下的ansible-deploy目录复制到WORK_DIR/cluster.id目录下
-        runtime_task.start_time = datetime.fromtimestamp(datetime.now().timestamp())
-        task_info = runtime_task
-        TaskSQL.insert(runtime_task)
+        if cluster.type == "hosted_k8s":
+            worker_task = Taskinfo(task_id=task_id, cluster_id=cluster.id, state="progress",
+                            start_time=datetime.fromtimestamp(datetime.now().timestamp()),
+                            msg=TaskService.TaskMessage.worker_deploy.name)
+            component_task = Taskinfo(task_id=task_id)
+            worker_task.start_time = datetime.fromtimestamp(datetime.now().timestamp())
+            task_info = worker_task
+            TaskSQL.insert(worker_task)
+        else:
+            runtime_task = Taskinfo(task_id=task_id, cluster_id=cluster.id, state="progress",
+                            start_time=datetime.fromtimestamp(datetime.now().timestamp()),
+                            msg=TaskService.TaskMessage.runtime_prepair.name)
+            etcd_task = Taskinfo(task_id=task_id)
+            control_plane_task = Taskinfo(task_id=task_id)
+            worker_task = Taskinfo(task_id=task_id)
+            component_task = Taskinfo(task_id=task_id)
+            runtime_task.start_time = datetime.fromtimestamp(datetime.now().timestamp())
+            task_info = runtime_task
+            TaskSQL.insert(runtime_task)
+
         ansible_dir = os.path.join(WORK_DIR, "ansible-deploy")
         os.chdir(ansible_dir)
         host_file = os.path.join(WORK_DIR, "ansible-deploy", "inventory", str(cluster.id))
@@ -583,7 +590,7 @@ def deploy_kubernetes(cluster: ClusterObject, lb_ip: str, task_id: str = None):
                                                    msg=TaskService.TaskMessage.worker_deploy.name)
                             TaskSQL.insert(worker_task)
                             task_info = worker_task
-                    if task_name == work_node_task_name and host is not None and task_status != "failed":
+                    if (task_name == work_node_task_name or task_name == hosted_k8s_worker_task_name) and host is not None and task_status != "failed":
                         if not worker_bool:
                             worker_bool = True
                             worker_task.end_time = datetime.fromtimestamp(datetime.now().timestamp())
@@ -1385,27 +1392,24 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
             ansible_result = scale_kubernetes(cluster.id, scale_nodes, task_id)
         else:
             if cluster.type == "hosted_k8s":
+                task_info = Taskinfo(task_id=task_id, cluster_id=cluster_tf_dict["id"], state="progress",
+                        start_time=datetime.fromtimestamp(datetime.now().timestamp()),
+                        msg=TaskService.TaskMessage.controller_deploy.name)
+                TaskSQL.insert(task_info)
+
                 # hosted_k8s 类型：使用 Kamaji 创建托管控制平面
                 print(f"开始为 hosted_k8s 集群 {cluster.name} 创建 Kamaji TenantControlPlane")
-
-                # 更新任务状态为正在创建 Kamaji 控制平面
-                task_info.detail = "正在创建 Kamaji 控制平面..."
-                update_task_state(task_info)
 
                 tcp_created = create_kamaji_tenant_control_plane(cluster, cluster_tfvars)
                 if not tcp_created:
                     raise Exception("创建 Kamaji TenantControlPlane 失败")
-
-                # 更新任务状态为等待控制平面就绪
-                task_info.detail = "Kamaji 控制平面创建成功，等待就绪..."
-                update_task_state(task_info)
 
                 tcp_ready, control_plane_endpoint = get_tenant_control_plane_status(cluster)
                 if not tcp_ready:
                     raise Exception("TenantControlPlane 准备就绪超时")
 
                 # 更新任务状态为获取 kubeconfig
-                task_info.detail = "控制平面就绪，正在获取 kubeconfig..."
+                task_info.detail = TaskService.TaskDetail.controller_deploy.value
                 update_task_state(task_info)
 
                 # 获取租户集群的kubeconfig
@@ -1500,7 +1504,7 @@ def get_ips(cluster_tfvars, task_info, host_file, cluster_dir):
     hosts_data = json.loads(hosts)
 
     # 如果是 hosted_k8s 类型，返回空值
-    if hasattr(cluster_tfvars, 'type') and cluster_tfvars.type == "hosted_k8s":
+    if  cluster_tfvars.number_of_k8s_masters == 0:
         return "", "", hosts_data
     # 从_meta.hostvars中获取master节点的IP
     master_node_name = cluster_tfvars.cluster_name + "-k8s-master-1"
@@ -1650,9 +1654,9 @@ def delete_cluster(self, cluster_id, token):
             # 查询集群信息以确定类型
             query_params = {}
             query_params["id"] = cluster_id
-            count, db_clusters = ClusterSQL.list_clusters(query_params, 1, 10, None, None)
-            if count > 0 and db_clusters.get("data"):
-                cluster_info = db_clusters.get("data")[0]
+            count, db_clusters = ClusterSQL.list_cluster(query_params, 1, 10, None, None)
+            if count > 0:
+                cluster_info = db_clusters[0]
                 if cluster_info.type == "hosted_k8s":
                     print(f"检测到托管版K8s集群，开始删除 Kamaji TenantControlPlane")
 
@@ -1898,12 +1902,10 @@ def delete_node(self, cluster_id, cluster_name, node_list, instance_list, extrav
                 content = json.loads(f.read())
             cluster_tfvars = ClusterTFVarsObject()
             cluster_tfvars.cluster_name = cluster_name
-            cluster_tfvars.number_of_k8s_masters = content.get("number_of_k8s_masters", 1)
-            if cluster_tfvars.type == "hosted_k8s":
-                cluster_tfvars.number_of_k8s_masters = 0
+            cluster_tfvars.number_of_k8s_masters = content.get("number_of_k8s_masters", 0)
             cluster_tfvars.ssh_user = content.get("ssh_user")
             cluster_tfvars.password = content.get("password")
-            cluster_tfvars.type = content.get("type")
+
 
             master_ip, lb_ip, hosts_data = get_ips(cluster_tfvars, task_info, host_file, cluster_dir)
 
@@ -2646,10 +2648,35 @@ def create_kamaji_tenant_control_plane(cluster: ClusterObject, cluster_tfvars: C
         # 1. 创建 K8sClient 实例（复用同一个实例）
         k8s_client = K8sClient(kubeconfig_path=MANAGEMENT_CLUSTER_KUBECONFIG_PATH)
 
-        # 2. 组装 TenantControlPlane YAML
+        # 2. 创建命名空间（如果不存在）
+        try:
+            namespace_body = {
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": cluster.project_id,
+                    "labels": {
+                        "name": cluster.project_id
+                    }
+                }
+            }
+            k8s_client.create_resource(
+                resource_body=namespace_body,
+                resource_type="namespaces",
+                api_version="v1"
+            )
+            print(f"成功创建命名空间: {cluster.project_id}")
+        except Exception as e:
+            # 如果命名空间已存在，不报错
+            if "already exists" in str(e) or "409" in str(e):
+                print(f"命名空间 '{cluster.project_id}' 已存在，跳过创建")
+            else:
+                raise Exception(f"创建命名空间 '{cluster.project_id}' 失败: {e}")
+
+        # 3. 组装 TenantControlPlane YAML
         tcp_yaml = generate_tenant_control_plane_yaml(cluster, cluster_tfvars)
 
-        # 3. 创建 TenantControlPlane 资源
+        # 4. 创建 TenantControlPlane 资源
         result = k8s_client.create_resource(
             resource_body=tcp_yaml,
             resource_type="tenantcontrolplanes",
@@ -2706,7 +2733,7 @@ def generate_tenant_control_plane_yaml(cluster: ClusterObject, cluster_tfvars: C
                 "service": {
                     "additionalMetadata": {
                         "annotations": {
-                            "loadbalancer.openstack.org/floating-network-id": cluster_tfvars.external_net,
+                           # loadbalancer.openstack.org/floating-network-id": cluster_tfvars.external_net,
                             "service.beta.kubernetes.io/openstack-internal-load-balancer": "false"
                         }
                     },
