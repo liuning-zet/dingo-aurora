@@ -6,35 +6,69 @@ from datetime import datetime, timedelta
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.schedulers.background import BackgroundScheduler
-from oslo_log import log
+from dingo_command.utils.helm.util import ChartLOG as LOG
 
-from dingo_command.db.models.chart.sql import AppSQL, RepoSQL
+from dingo_command.db.models.chart.sql import AppSQL, RepoSQL, ChartSQL
 from dingo_command.db.models.cluster.sql import ClusterSQL
 from dingo_command.services.chart import ChartService
 from dingo_command.api.model.chart import CreateRepoObject, CreateAppObject
 from dingo_command.utils.helm import util
+from dingo_command.celery_api import CONF
+from dingo_command.utils.helm.redis_lock import RedisSentinelDistributedLock
 
 
-LOG = log.getLogger(__name__)
 config_dir = "/tmp/kube_config_dir"
 scheduler = BackgroundScheduler()
 scheduler_async = AsyncIOScheduler()
-
 blocking_scheduler = BlockingScheduler()
 # 启动完成后执行
 run_time_10s = datetime.now() + timedelta(seconds=10)  # 任务将在10秒后执行
 run_time_30s = datetime.now() + timedelta(seconds=30)  # 任务将在30秒后执行
 chart_service = ChartService()
+SENTINEL_URL = CONF.redis.sentinel_url
+master_name = "kolla"
 
 
 def start():
     # 添加检查集群状态的定时任务，每180秒执行一次
-    scheduler.add_job(check_app_status, 'interval', seconds=300)
-    scheduler.add_job(check_cluster_status, 'interval', seconds=3600)
+    scheduler.add_job(run_once, 'interval', seconds=180, args=[check_app_status], next_run_time=datetime.now())
+    scheduler.add_job(run_once, 'interval', seconds=180, args=[remove_global_chart],
+                      next_run_time=datetime.now())
+    scheduler.add_job(run_once, 'interval', args=[check_cluster_status], seconds=1800,
+                      next_run_time=datetime.now())
     scheduler.start()
-    scheduler_async.add_job(check_sync_status,'cron', hour=0, minute=0)
+    scheduler_async.add_job(start_async,'cron', hour=0, minute=0, args=[check_sync_status])
     scheduler_async.start()
 
+async def start_async(func):
+    lock = RedisSentinelDistributedLock(
+        sentinel_url=SENTINEL_URL,
+        master_name=master_name,
+        lock_key=str(func.__name__),
+        expire_time=30
+    )
+    try:
+        with lock:
+            await func()
+            time.sleep(3)
+    except Exception as e:
+        if "acquire lock" not in str(e):
+            LOG.error(f"执行过程中发生错误: {e} with {func.__name__}")
+
+def run_once(func):
+    lock = RedisSentinelDistributedLock(
+        sentinel_url=SENTINEL_URL,
+        master_name=master_name,
+        lock_key=str(func.__name__),
+        expire_time=30
+    )
+    try:
+        with lock:
+            func()
+            time.sleep(3)
+    except Exception as e:
+        if "acquire lock" not in str(e):
+            LOG.error(f"执行过程中发生错误: {e} with {func.__name__}")
 
 def check_app_status():
     """
@@ -84,6 +118,8 @@ def check_app_status():
             content = chart_service.get_helm_list(config_file)
             content_list = json.loads(content)
             for app in apps:
+                if app.status != util.app_status_success:
+                    continue
                 flag = False
                 # 看看数据库中的app是否存在，如果存在，但是helm list中不存在，说明app已经被删除，需要重新安装下这个app
                 # 3、比对app的名称和数据库中的app名称是否存在，如果数据库中存在但是helm list中不存在，说明app已经被删除，
@@ -170,9 +206,11 @@ def check_cluster_status():
         query_params["is_global"] = True
         count, repos = RepoSQL.list_repos(query_params, page_size=-1)
         if count < 1:
+            LOG.info(f"Finished check cluster_status at {time.strftime('%Y-%m-%d %H:%M:%S')}")
             return
         repo = repos[0]
         if not repo.except_cluster:
+            LOG.info(f"Finished check cluster_status at {time.strftime('%Y-%m-%d %H:%M:%S')}")
             return
         except_cluster = json.loads(repo.except_cluster)
         for cluster_id in real_remove_cluster_list:
@@ -183,6 +221,30 @@ def check_cluster_status():
         LOG.info(f"Finished check cluster_status at {time.strftime('%Y-%m-%d %H:%M:%S')}")
     except Exception as e:
         LOG.error(f"Error in cluster_status: {str(e)}")
+
+
+def remove_global_chart():
+    """
+    定期检查k8s集群状态并更新数据库
+    """
+    try:
+        LOG.info(f"Starting remove chart at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        # 1、先获取cluster的状态，如果已经删除那就把所有的关于此cluster的repo都删除
+        query_params = {}
+        query_params["repo_id"] = "1"
+        remove_chart_list = []
+        chart_name_list = []
+        count, charts = ChartSQL.list_charts(query_params, page_size=-1)
+        for chart in charts:
+            if chart.name in chart_name_list:
+                remove_chart_list.append(chart)
+                continue
+            if chart.status != util.chart_status_stop:
+                chart_name_list.append(chart.name)
+        ChartSQL.delete_chart_list(remove_chart_list)
+        LOG.info(f"Finished remove chart at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    except Exception as e:
+        LOG.error(f"Error in remove_chart: {str(e)}")
 
 
 async def check_sync_status():
@@ -198,6 +260,8 @@ async def check_sync_status():
         if not data.get("data"):
             raise ValueError("repo not found")
         repo_data = data.get("data")
+        # if repo_data.status == util.repo_status_sync:
+        #     return
         # 先删除原来的repo的charts应用
         data = chart_service.get_repo_from_name(repo_id)
         if data.get("data"):

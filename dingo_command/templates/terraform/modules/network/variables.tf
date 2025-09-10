@@ -2,6 +2,10 @@ variable "external_net" {}
 
 variable "admin_network_name" {}
 
+variable "admin_network_id" {}
+
+variable "bus_network_id" {}
+
 variable "bus_network_name" {}
 
 variable "network_dns_domain" {}

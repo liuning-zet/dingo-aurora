@@ -1,3 +1,4 @@
+import time
 from typing import Union
 import asyncio
 from datetime import datetime
@@ -6,20 +7,40 @@ from fastapi import Query
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from dingo_command.api.model.chart import CreateRepoObject, CreateAppObject
 from dingo_command.services.chart import ChartService, create_harbor_repo, create_tag_info
-from dingo_command.db.models.chart.sql import RepoSQL, AppSQL, ChartSQL, TagSQL
+from dingo_command.db.models.chart.sql import RepoSQL
 from dingo_command.utils.helm.util import ChartLOG as Log
+from dingo_command.utils.helm.redis_lock import RedisSentinelDistributedLock
+from dingo_command.celery_api import CONF
 from dingo_command.utils.helm import util
 
 router = APIRouter()
 chart_service = ChartService()
+SENTINEL_URL = CONF.redis.sentinel_url
 
 async def init():
     """
     初始化函数，用于初始化一些全局变量
     :return:
     """
-    await create_harbor_repo()
-    create_tag_info()
+    master_name = "kolla"
+    lock = RedisSentinelDistributedLock(
+        sentinel_url=SENTINEL_URL,
+        master_name=master_name,
+        lock_key="my_resource_lock",
+        expire_time=30
+    )
+    try:
+        with lock:
+            await create_harbor_repo()
+            create_tag_info()
+            time.sleep(3)
+    except Exception as e:
+        if "acquire lock" not in str(e):
+            Log.error(f"执行过程中发生错误: {e}")
+            import traceback
+            traceback.print_exc()
+            raise e
+
 
 asyncio.run(init())
 
@@ -68,9 +89,17 @@ async def list_repos(background_tasks: BackgroundTasks, cluster_id: str = Query(
         current_time = datetime.now()
         repo_list = []
         for repo in data.get("data"):
-            if repo.id == 1 or repo.id == "1" or repo.status != "creating":
+            if repo.id == 1 or repo.id == "1" or repo.status not in (util.repo_status_create, util.repo_status_update,
+                                                                     util.repo_status_sync):
                 continue
-            if (current_time - repo.create_time).total_seconds() < util.repo_update_time_out:
+            if (repo.status == util.repo_status_create and (current_time - repo.create_time).total_seconds()
+                    < util.repo_update_time_out):
+                continue
+            if (repo.status == util.repo_status_update and (current_time - repo.update_time).total_seconds()
+                    < util.repo_update_time_out):
+                continue
+            if (repo.status == util.repo_status_sync and (current_time - repo.update_time).total_seconds()
+                    < util.repo_update_time_out):
                 continue
             repo_data_info = CreateRepoObject(
                 id=str(repo.id),
@@ -212,14 +241,13 @@ async def sync_repo(repo_id: Union[str, int], background_tasks: BackgroundTasks)
             raise ValueError("repo not found")
         repo_data = data.get("data")
         # 先删除原来的repo的charts应用
-        data = chart_service.get_repo_from_name(repo_id)
-        repo = data.get("data")[0]
-        if repo.status == util.repo_status_create:
+        if repo_data.status == util.repo_status_create:
             raise ValueError("repo is creating, please wait")
-        if repo.status == util.repo_status_update:
+        if repo_data.status == util.repo_status_update:
             raise ValueError("repo is updating, please wait")
-        if repo.status == util.repo_status_sync:
+        if repo_data.status == util.repo_status_sync:
             raise ValueError("repo is syncing, please wait")
+        data = chart_service.get_repo_from_name(repo_id)
         if data.get("data"):
             chart_service.delete_charts_repo_id(data.get("data"))
         # 再添加新的repo的charts应用
@@ -303,6 +331,8 @@ async def start_repo(repo_id: Union[str, int], cluster_id: str = Query(None, des
 @router.get("/charts/list", summary="显示所有的charts信息", description="显示所有的charts信息")
 async def get_repo_charts(cluster_id: str = Query(None, description="集群id"),
                      repo_id: str = Query(None, description="集群id"),
+                     id: str = Query(None, description="chart的id"),
+                     name: str = Query(None, description="chart的name"),
                      repo_name: str = Query(None, description="集群id"),
                      tag_id: int = Query(None, description="tag的id"),
                      tag_name: str = Query(None, description="tag的name"),
@@ -331,6 +361,10 @@ async def get_repo_charts(cluster_id: str = Query(None, description="集群id"),
             query_params['tag_name'] = tag_name
         if type:
             query_params['type'] = type
+        if name:
+            query_params['name'] = name
+        if id:
+            query_params['id'] = id
         # 显示repo列表的逻辑
         return chart_service.list_charts(query_params, page, page_size, sort_keys, sort_dirs)
     except Exception as e:
@@ -380,13 +414,14 @@ async def get_tags(tag_id: Union[str, int]):
         raise HTTPException(status_code=400, detail=f"get tag detail error: {str(e)}")
 
 @router.get("/app/list", summary="显示所有的已安装应用信息", description="显示所有的已安装应用信息")
-async def get_apps(app_id: str = Query(None, description="集群id"),
-                     app_name: str = Query(None, description="集群id"),
+async def get_apps(app_id: str = Query(None, description="app的id"),
+                     app_name: str = Query(None, description="app名称"),
                      cluster_id: str = Query(None, description="集群id"),
-                     chart_id: str = Query(None, description="集群id"),
-                     repo_id: str = Query(None, description="集群id"),
-                     repo_name: str = Query(None, description="集群id"),
-                     namespace: int = Query(None, description="tag的id"),
+                     chart_id: str = Query(None, description="chart的id"),
+                     chart_name: str = Query(None, description="chart名称"),
+                     repo_id: str = Query(None, description="repo的id"),
+                     repo_name: str = Query(None, description="repo名称"),
+                     namespace: int = Query(None, description="命名空间"),
                      tag_name: str = Query(None, description="tag的name"),
                      tag_id: str = Query(None, description="tag的name"),
                      status: str = Query(None, description="status状态"),
@@ -419,6 +454,8 @@ async def get_apps(app_id: str = Query(None, description="集群id"),
             query_params['type'] = type
         if chart_id:
             query_params['chart_id'] = chart_id
+        if chart_name:
+            query_params['chart_name'] = chart_name
         if repo_id:
             query_params['repo_id'] = repo_id
         if namespace:
@@ -533,6 +570,8 @@ async def get_apps(app_id: Union[str, int], background_tasks: BackgroundTasks):
 async def get_apps(create_data: CreateAppObject, background_tasks: BackgroundTasks):
     try:
         Log.info(f"install app {create_data.name}, data info {create_data}")
+        if not create_data.namespace:
+            create_data.namespace = "default"
         query_params = {}
         query_params["cluster_id"] = create_data.cluster_id
         data = chart_service.list_apps(query_params, 1, -1, None, None)
@@ -540,7 +579,7 @@ async def get_apps(create_data: CreateAppObject, background_tasks: BackgroundTas
             for app_data in data.get("data"):
                 if app_data.name == create_data.name and app_data.namespace == create_data.namespace:
                     raise ValueError("app name already exists")
-
+        
         background_tasks.add_task(chart_service.install_app, create_data, update=False)
         return {"success": True, "message": "install app started, please wait"}
     except Exception as e:

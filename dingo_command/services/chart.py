@@ -1,5 +1,3 @@
-import time
-
 import json
 import os
 import uuid
@@ -9,7 +7,6 @@ import shutil
 from requests.auth import HTTPBasicAuth
 from datetime import datetime
 from math import ceil
-from openpyxl.styles import Border, Side
 from yaml import CLoader
 import yaml
 from harborapi import HarborAsyncClient
@@ -26,8 +23,6 @@ from dingo_command.db.models.chart.models import AppInfo as AppDB
 from dingo_command.db.models.chart.models import TagInfo as TagDB
 from dingo_command.db.models.chart.sql import RepoSQL, AppSQL, ChartSQL, TagSQL
 from dingo_command.services.cluster import ClusterService
-
-from dingo_command.services.system import SystemService
 from dingo_command.services import CONF
 from dingo_command.utils.helm import util
 from dingo_command.utils.helm.util import ChartLOG as Log
@@ -48,14 +43,14 @@ async def create_harbor_repo(repo_name=util.repo_global_name, url=harbor_url, us
     """
     # 创建全局harbor的仓库，如果已经存在就不创建，如果不存在才会创建
     try:
+        Log.info("starting add global repo with harbor")
         query_params = {}
         query_params['name'] = repo_name
         query_params['cluster_id'] = util.repo_global_cluster_id
         data = ChartService().list_repos(query_params, 1, -1, None, None)
         if data.get("total") > 0:
             # 是否要添加当repo的url修改了，重新创建harbor的仓库的charts包
-            if (data.get("data")[0].url != url and data.get("data")[0].status == util.repo_status_success or
-                    data.get("data")[0].status == util.repo_status_failed):
+            if data.get("data")[0].url != url or data.get("data")[0].status != util.repo_status_success:
                 repo_info_db = data.get("data")[0]
                 repo_info_db.url = url
                 repo_info_db.username = username
@@ -85,6 +80,7 @@ async def create_harbor_repo(repo_name=util.repo_global_name, url=harbor_url, us
         repo_info_db.status = "creating"
         RepoSQL.create_repo(repo_info_db)
         await ChartService().handle_oci_repo(repo_info_db)
+        Log.info("finished add global repo with harbor")
     except asyncio.TimeoutError as e:
         Log.error("Harbor API请求超时，请检查网络或Harbor服务状态")
         raise e
@@ -632,6 +628,7 @@ class ChartService:
                             dict_info["create_time"] = dict_version["create_time"]
                             dict_info["readme_url"] = harbor_url + dict_tmp_info.get("readme.md").get("href")
                             dict_info["values_url"] = harbor_url + dict_tmp_info.get("values.yaml").get("href")
+                            dict_info["app_version"] = dict_chart_info.get("appVersion")
                             dict_version["version"][dict_chart_info.get("version")] = dict_info
 
                         chart_info_db = self.convert_db_harbor(chartname, dict_version, repo_info_db, prefix_name)
@@ -704,6 +701,7 @@ class ChartService:
                         else:
                             dict_info["create_time"] = version.get("created")
                         dict_info["urls"] = version.get("urls")
+                        dict_info["app_version"] = version.get("appVersion")
                         dict_info["deprecated"] = version.get("deprecated", False)
                         dict_version["version"][version.get("version")] = dict_info
                     chart_info_db = self.convert_chart_db(chart_name, dict_version, repo_info_db)
@@ -1046,31 +1044,36 @@ class ChartService:
     def get_kubeconfig(self, cluster_id):
         res_cluster = ClusterService().get_cluster(cluster_id)
         helm_cache_dir = os.path.join(WORK_DIR, "ansible-deploy/inventory/", cluster_id, util.helm_cache)
-        print("helm_cache_dir is:", helm_cache_dir)
         os.makedirs(helm_cache_dir, exist_ok=True)
         kube_config = os.path.join(WORK_DIR, "ansible-deploy/inventory/", cluster_id, "kube_config")
         with open(kube_config, "w") as f :
-            f.write(yaml.dump(json.loads(res_cluster.kube_info.kube_config)))
+            f.write(res_cluster.kube_info.kube_config)
+            # f.write(yaml.dump(json.loads(res_cluster.kube_info.kube_config)))
         return kube_config, helm_cache_dir
 
     def convert_app_db(self, create_data: ChartDB, create_info: CreateAppObject, update=False):
         app_db = AppDB()
+        dict_version = json.loads(create_data.version)
         if update:
             app_db.id = create_info.id
             app_db.status = util.app_status_update
             app_db.version = create_info.chart_version
+            app_db.app_version = dict_version.get(create_info.chart_version).get("app_version")
             app_db.update_time = datetime.now()
             return app_db
         else:
             app_db.status = util.app_status_create
             app_db.create_time = datetime.now()
+            app_db.update_time = datetime.now()
         app_db.name = create_info.name
         app_db.cluster_id = create_info.cluster_id
         app_db.chart_id = create_data.id
+        app_db.chart_name = create_data.name
         app_db.repo_id = create_data.repo_id
         app_db.version = create_info.chart_version
+        app_db.app_version = dict_version.get(create_info.chart_version).get("app_version")
         app_db.values = json.dumps(create_info.values)
-        app_db.namespace = create_info.namespace
+        app_db.namespace = create_info.namespace or "default"
         app_db.description = create_info.description
         app_db.repo_name = create_data.repo_name
         app_db.type = create_data.type
@@ -1238,6 +1241,9 @@ class ChartService:
             AppSQL.delete_app(app_data)
         except Exception as e:
             # 写入failed的状态
+            if "not found" in str(e):
+                AppSQL.delete_app(app_data)
+                return
             app_data.status = util.app_status_failed
             app_data.status_msg = str(e)
             AppSQL.update_app(app_data)
@@ -1263,6 +1269,31 @@ class ChartService:
         else:
             return result.stdout
 
+    def get_helm_release_manifest(self, release_name, kube_config, namespace='default'):
+        """
+        获取指定Helm release的所有资源的YAML清单
+        """
+        try:
+            # 构建命令
+            cmd = ['helm', 'get', 'manifest', release_name, '-n', namespace, '--kubeconfig', kube_config]
+            # 执行命令并捕获输出
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            release_manifest = result.stdout
+            parsed_documents = list(yaml.safe_load_all(release_manifest))
+
+            k8s_resources_dict = {}
+            for doc in parsed_documents:
+                if doc is not None:  # 确保文档不为空
+                    kind = doc.get('kind')
+                    name = doc['metadata'].get('name') if doc.get('metadata') else 'Unknown'
+                    # 使用 kind 和 name 组合作为键，以确保唯一性
+                    key = f"{kind}_{name}"
+                    k8s_resources_dict[key] = doc
+            return k8s_resources_dict
+        except subprocess.CalledProcessError as e:
+            Log.error(f"Error fetching manifest for release {release_name}: {e}")
+            raise ValueError(f"Error fetching manifest for release {release_name}: {e}")
+
     def get_app_detail(self, app_data: AppDB):
         try:
             query_params = {}
@@ -1276,12 +1307,19 @@ class ChartService:
                 content = self.get_info_cmd(kube_config, app_data.namespace, app_data.name)
                 dict_content = json.loads(content)
                 resourc_obj_list = []
+                dict_yaml_info = self.get_helm_release_manifest(app_data.name, kube_config, app_data.namespace)
                 # 1、获取chart信息
+                update_time = app_data.update_time.isoformat() if app_data.update_time else None
                 app_obj = AppChartObject(
                     name=chart_data.name,
                     description=chart_data.description,
                     repo_name=chart_data.repo_name,
-                    icon=chart_data.icon
+                    icon=chart_data.icon,
+                    namespace=app_data.namespace,
+                    app_name=app_data.name,
+                    update_time=update_time,
+                    chart_version=app_data.version,
+                    app_version=app_data.app_version
                 )
 
                 if dict_content.get("info") and dict_content.get("info").get("resources"):
@@ -1303,7 +1341,9 @@ class ChartService:
                                         name=vv.get("metadata").get("name"),
                                         namespace=vv.get("metadata").get("namespace"),
                                         kind=vv.get("kind"),
-                                        status=vv.get("status").get("phase")
+                                        status=vv.get("status").get("phase"),
+                                        yaml=json.dumps(dict_yaml_info.get(
+                                            f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
                                     )
                                     resourc_obj_list.append(resourc_obj)
                                     continue
@@ -1317,7 +1357,9 @@ class ChartService:
                                                 name=vv.get("metadata").get("name"),
                                                 namespace=vv.get("metadata").get("namespace"),
                                                 kind=vv.get("kind"),
-                                                status=util.resource_status_active
+                                                status=util.resource_status_active,
+                                                yaml=json.dumps(dict_yaml_info.get(
+                                                    f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
                                             )
                                             resourc_obj_list.append(resourc_obj)
                                             continue
@@ -1326,7 +1368,9 @@ class ChartService:
                                                 name=vv.get("metadata").get("name"),
                                                 namespace=vv.get("metadata").get("namespace"),
                                                 kind=vv.get("kind"),
-                                                status=util.resource_status_pend
+                                                status=util.resource_status_pend,
+                                                yaml=json.dumps(dict_yaml_info.get(
+                                                    f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
                                             )
                                             resourc_obj_list.append(resourc_obj)
                                             continue
@@ -1335,7 +1379,9 @@ class ChartService:
                                             name=vv.get("metadata").get("name"),
                                             namespace=vv.get("metadata").get("namespace"),
                                             kind=vv.get("kind"),
-                                            status=util.resource_status_failed
+                                            status=util.resource_status_failed,
+                                            yaml=json.dumps(dict_yaml_info.get(
+                                                f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
                                         )
                                         resourc_obj_list.append(resourc_obj)
                                         continue
@@ -1345,7 +1391,9 @@ class ChartService:
                                                 name=vv.get("metadata").get("name"),
                                                 namespace=vv.get("metadata").get("namespace"),
                                                 kind=vv.get("kind"),
-                                                status=util.resource_status_pend
+                                                status=util.resource_status_pend,
+                                                yaml=json.dumps(dict_yaml_info.get(
+                                                    f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
                                             )
                                             resourc_obj_list.append(resourc_obj)
                                             continue
@@ -1354,7 +1402,9 @@ class ChartService:
                                                 name=vv.get("metadata").get("name"),
                                                 namespace=vv.get("metadata").get("namespace"),
                                                 kind=vv.get("kind"),
-                                                status=util.resource_status_active
+                                                status=util.resource_status_active,
+                                                yaml=json.dumps(dict_yaml_info.get(
+                                                    f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
                                             )
                                             resourc_obj_list.append(resourc_obj)
                                             continue
@@ -1363,7 +1413,9 @@ class ChartService:
                                             name=vv.get("metadata").get("name"),
                                             namespace=vv.get("metadata").get("namespace"),
                                             kind=vv.get("kind"),
-                                            status=util.resource_status_active
+                                            status=util.resource_status_active,
+                                            yaml=json.dumps(dict_yaml_info.get(
+                                                f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
                                         )
                                         resourc_obj_list.append(resourc_obj)
                                         continue
@@ -1374,7 +1426,9 @@ class ChartService:
                                                 name=vv.get("metadata").get("name"),
                                                 namespace=vv.get("metadata").get("namespace"),
                                                 kind=vv.get("kind"),
-                                                status=util.resource_status_active
+                                                status=util.resource_status_active,
+                                                yaml=json.dumps(dict_yaml_info.get(
+                                                    f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
                                             )
                                             resourc_obj_list.append(resourc_obj)
                                             continue
@@ -1383,7 +1437,9 @@ class ChartService:
                                                 name=vv.get("metadata").get("name"),
                                                 namespace=vv.get("metadata").get("namespace"),
                                                 kind=vv.get("kind"),
-                                                status=util.resource_status_pend
+                                                status=util.resource_status_pend,
+                                                yaml=json.dumps(dict_yaml_info.get(
+                                                    f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
                                             )
                                             resourc_obj_list.append(resourc_obj)
                                             continue
@@ -1395,7 +1451,9 @@ class ChartService:
                                                 name=vv.get("metadata").get("name"),
                                                 namespace=vv.get("metadata").get("namespace"),
                                                 kind=vv.get("kind"),
-                                                status=util.resource_status_active
+                                                status=util.resource_status_active,
+                                                yaml=json.dumps(dict_yaml_info.get(
+                                                    f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
                                             )
                                             resourc_obj_list.append(resourc_obj)
                                             continue
@@ -1404,7 +1462,9 @@ class ChartService:
                                                 name=vv.get("metadata").get("name"),
                                                 namespace=vv.get("metadata").get("namespace"),
                                                 kind=vv.get("kind"),
-                                                status=util.resource_status_pend
+                                                status=util.resource_status_pend,
+                                                yaml=json.dumps(dict_yaml_info.get(
+                                                    f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
                                             )
                                             resourc_obj_list.append(resourc_obj)
                                             continue
@@ -1414,7 +1474,9 @@ class ChartService:
                                         name=vv.get("metadata").get("name"),
                                         namespace=vv.get("metadata").get("namespace"),
                                         kind=vv.get("kind"),
-                                        status=util.resource_status_active
+                                        status=util.resource_status_active,
+                                        yaml=json.dumps(dict_yaml_info.get(
+                                            f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
                                     )
                                     resourc_obj_list.append(resourc_obj)
                                     continue
@@ -1422,7 +1484,9 @@ class ChartService:
                                     name=vv.get("metadata").get("name"),
                                     namespace=vv.get("metadata").get("namespace"),
                                     kind=vv.get("kind"),
-                                    status=util.resource_status_unknown
+                                    status=util.resource_status_unknown,
+                                    yaml=json.dumps(dict_yaml_info.get(
+                                        f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
                                 )
                                 resourc_obj_list.append(resourc_obj)
 

@@ -12,7 +12,20 @@ resource "openstack_networking_router_v2" "cluster" {
 
 resource "openstack_networking_network_v2" "cluster" {
   name                  = var.cluster_name
-  count                 = var.use_neutron
+  count                 = var.use_existing_network && var.admin_network_id != "" ? 0 : 1
+  dns_domain            = var.network_dns_domain != null ? var.network_dns_domain : null
+  admin_state_up        = "true"
+  #port_security_enabled = var.port_security_enabled
+  #segments {
+  #  network_type    = "vlan"
+  #  physical_network = "physnet1"
+  #}
+}
+
+
+resource "openstack_networking_network_v2" "bus_cluster" {
+  name                  = var.cluster_name
+  count                 = var.use_existing_network && var.bus_network_id != "" ? 0 : 1
   dns_domain            = var.network_dns_domain != null ? var.network_dns_domain : null
   admin_state_up        = "true"
   #port_security_enabled = var.port_security_enabled
@@ -24,7 +37,7 @@ resource "openstack_networking_network_v2" "cluster" {
 
 resource "openstack_networking_subnet_v2" "cluster" {
   name            = "${var.cluster_name}-internal-network"
-  count           = var.use_neutron
+  count           =  var.use_existing_network && var.bus_network_id != "" ? 0 : var.use_neutron
   network_id      = openstack_networking_network_v2.cluster[count.index].id
   cidr            = var.subnet_cidr
   ip_version      = 4
@@ -40,8 +53,14 @@ resource "openstack_networking_subnet_v2" "bussiness" {
   dns_nameservers = var.dns_nameservers
 }
 
+
 resource "openstack_networking_router_interface_v2" "cluster" {
-  count     = var.use_neutron
-  router_id = "%{if length(data.openstack_networking_router_v2.cluster) == 0}${openstack_networking_router_v2.cluster[count.index].id}%{else}${data.openstack_networking_router_v2.cluster[count.index].id}%{endif}"
-  subnet_id = openstack_networking_subnet_v2.cluster[count.index].id
+  count     = var.use_neutron == 1 && (
+                var.use_existing_network == false ||
+                var.admin_subnet_id == "" ||
+                length(data.openstack_networking_router_v2.cluster) == 0
+              ) ? 1 : 0
+  router_id = length(data.openstack_networking_router_v2.cluster) == 0 ? openstack_networking_router_v2.cluster[0].id : data.openstack_networking_router_v2.cluster[0].id
+  subnet_id = var.use_existing_network && var.admin_subnet_id != "" ? var.admin_subnet_id : openstack_networking_subnet_v2.cluster[0].id
 }
+

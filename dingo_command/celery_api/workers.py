@@ -109,6 +109,7 @@ class ClusterTFVarsObject(BaseModel):
     cluster_name: Optional[str] = Field(None, description="集群id")
     image_uuid: Optional[str] = Field(None, description="用户id")
     nodes: Optional[Dict[str, NodeGroup]] = Field(None, description="集群状态")
+    masters: Optional[Dict[str, NodeGroup]] = Field(None, description="集群状态")
     admin_subnet_id: Optional[str] = Field(None, description="管理子网id")
     bus_network_id: Optional[str] = Field(None, description="业务网络id")
     admin_network_id: Optional[str] = Field(None, description="管理网id")
@@ -691,7 +692,7 @@ def scale_kubernetes(cluster_id, scale_nodes, task_id):
                 private_key_content = key_file.read()
         else:
             private_key_content = None
-
+        #print
         thread, runner = run_playbook(playbook_file, host_file, ansible_dir,
                                       ssh_key=private_key_content, limit=scale_nodes)
         # 处理并打印事件日志
@@ -787,6 +788,9 @@ def get_cluster_kubeconfig(cluster: ClusterTFVarsObject, lb_ip, master_ip, float
     """获取集群的kubeconfig配置"""
 
     print(f"lb_ip: {lb_ip}, master_ip: {master_ip}, float_ip: {float_ip}")
+    ssh_user  = "root"
+    if cluster.ssh_user != None and cluster.ssh_user != "":
+        ssh_user = cluster.ssh_user
     try:
         kubeconfig = ""
         # SSH连接到master节点获取kubeconfig
@@ -796,7 +800,7 @@ def get_cluster_kubeconfig(cluster: ClusterTFVarsObject, lb_ip, master_ip, float
                     "ssh",
                     "-o", "StrictHostKeyChecking=no",
                     "-p", str(ssh_port),
-                    f"{cluster.ssh_user}@{float_ip}",
+                    f"{ssh_user}@{float_ip}",
                     "sudo cat /etc/kubernetes/admin.conf"
                 ],
                 capture_output=True,
@@ -812,7 +816,7 @@ def get_cluster_kubeconfig(cluster: ClusterTFVarsObject, lb_ip, master_ip, float
                     "-o", "StrictHostKeyChecking=no",
                     "-i", key_file_path,  # SSH私钥路径
                     "-p", str(ssh_port),
-                    f"{cluster.ssh_user}@{float_ip}",
+                    f"{ssh_user}@{float_ip}",
                     "sudo cat /etc/kubernetes/admin.conf"
                     ""
                 ],
@@ -1231,13 +1235,12 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
         # Give execute permissions to the host file
         host_file = os.path.join(WORK_DIR, "ansible-deploy", "inventory", cluster_tf_dict["id"], "hosts")
         os.chmod(host_file, 0o755)  # rwxr-xr-x permission
-
         master_ip, lb_ip, hosts_data = get_ips(cluster_tfvars, task_info, host_file, cluster_dir)
         # ensure /root/.ssh/known_hosts exists
         if os.path.exists("/root/.ssh/known_hosts"):
             for i in range(1, cluster_tfvars.number_of_k8s_masters + 1):
                 print(f"delete host from know_hosts  {task_id}")
-                master_node_name = f"{cluster_tfvars.cluster_name}-k8s-master-{i}"
+                master_node_name = f"{cluster_tfvars.cluster_name}-master-{i}"
                 tmp_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
                 cmd = f'ssh-keygen -f "/root/.ssh/known_hosts" -R "{tmp_ip}"'
                 result = subprocess.run(cmd, shell=True, capture_output=True)
@@ -1262,7 +1265,7 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
                         raise Exception("Ansible kubernetes deployment failed, configure ssh-keygen error")
         if cluster_tfvars.password != "":
             for i in range(1, cluster_tfvars.number_of_k8s_masters + 1):
-                master_node_name = f"{cluster_tfvars.cluster_name}-k8s-master-{str(i)}"
+                master_node_name = f"{cluster_tfvars.cluster_name}-master-{str(i)}"
                 #ssh_port = hosts_data["_meta"]["hostvars"][master_node_name].get("ansible_port", 22)
                 tmp_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
                 
@@ -1429,7 +1432,7 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
                 lb_ip = control_plane_endpoint.split(':')[0]  # 提取 IP 地址部分
             else:
                 # 从_meta.hostvars中获取master节点的IP
-                master_node_name = cluster_tfvars.cluster_name + "-k8s-master-1"
+                master_node_name = cluster_tfvars.cluster_name + "-master-1"
                 master_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ip"]
                 float_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
                 ssh_port = hosts_data["_meta"]["hostvars"][master_node_name].get("ansible_port", 22)
@@ -1509,7 +1512,7 @@ def get_ips(cluster_tfvars, task_info, host_file, cluster_dir):
     if  cluster_tfvars.number_of_k8s_masters == 0:
         return "", "", hosts_data
     # 从_meta.hostvars中获取master节点的IP
-    master_node_name = cluster_tfvars.cluster_name + "-k8s-master-1"
+    master_node_name = cluster_tfvars.cluster_name + "-master-1"
     master_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
     lb_ip = hosts_data["_meta"]["hostvars"][master_node_name]["lb_ip"]
     return master_ip, lb_ip, hosts_data
@@ -1527,7 +1530,7 @@ def get_networks(cluster_tfvars, task_info, host_file, cluster_dir):
     hosts = res.stdout
     hosts_data = json.loads(hosts)
     # 从_meta.hostvars中获取master节点的IP
-    node_name = cluster_tfvars.cluster_name + "-k8s-master-1"
+    node_name = cluster_tfvars.cluster_name + "-master-1"
     if cluster_tfvars.number_of_k8s_masters == 0:
         node_name = cluster_tfvars.cluster_name + "-node-1"
     
@@ -1798,7 +1801,7 @@ def delete_cluster(self, cluster_id, token):
 
 
 def remove_node_exporter(cluster_tfvars, node_list, hosts_data, master_ip, cluster_dir):
-    master_node_name = f"{cluster_tfvars.cluster_name}-k8s-master-1"
+    master_node_name = f"{cluster_tfvars.cluster_name}-master-1"
     ssh_port = hosts_data["_meta"]["hostvars"][master_node_name].get("ansible_port", 22)
     for node in node_list:
         if cluster_tfvars.password:
@@ -1907,14 +1910,12 @@ def delete_node(self, cluster_id, cluster_name, node_list, instance_list, extrav
             cluster_tfvars.number_of_k8s_masters = content.get("number_of_k8s_masters", 0)
             cluster_tfvars.ssh_user = content.get("ssh_user")
             cluster_tfvars.password = content.get("password")
-
-
             master_ip, lb_ip, hosts_data = get_ips(cluster_tfvars, task_info, host_file, cluster_dir)
-
+            # ensure /root/.ssh/known_hosts exists
             if os.path.exists("/root/.ssh/known_hosts"):
                 for i in range(1, cluster_tfvars.number_of_k8s_masters + 1):
                     print(f"delete host from know_hosts  {task_id}")
-                    master_node_name = f"{cluster_tfvars.cluster_name}-k8s-master-{i}"
+                    master_node_name = f"{cluster_name}-master-{i}"
                     tmp_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
                     cmd = f'ssh-keygen -f "/root/.ssh/known_hosts" -R "{tmp_ip}"'
                     result = subprocess.run(cmd, shell=True, capture_output=True)
@@ -1937,9 +1938,9 @@ def delete_node(self, cluster_id, cluster_name, node_list, instance_list, extrav
                             task_info.detail = "Ansible kubernetes deployment failed, configure ssh-keygen error"
                             update_task_state(task_info)
                             raise Exception("Ansible kubernetes deployment failed, configure ssh-keygen error")
-            if cluster_tfvars.password != "":
+            if cluster_tfvars.password:
                 for i in range(1, cluster_tfvars.number_of_k8s_masters + 1):
-                    master_node_name = f"{cluster_tfvars.cluster_name}-k8s-master-{str(i)}"
+                    master_node_name = f"{cluster_tfvars.cluster_name}-master-{str(i)}"
                     #ssh_port = hosts_data["_meta"]["hostvars"][master_node_name].get("ansible_port", 22)
                     tmp_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
                     
@@ -2482,6 +2483,21 @@ def add_existing_nodes(self, cluster_id, server_details):
         
         with session.begin():
             for i, server_detail in enumerate(server_details):
+                
+                # 获取 base64 编码的 user_data
+                user_data_b64 = server_detail.get("OS-EXT-SRV-ATTR:user_data")
+                if not user_data_b64:
+                    return None
+
+                # 解码
+                user_data = base64.b64decode(user_data_b64).decode("utf-8")
+                user_pass = ""
+                # 正则提取 passwd 脚本内容
+                passwd_script = re.search(r"#!/bin/sh\s*echo\s+'([^']+)' \| chpasswd", user_data)
+                if passwd_script:
+                    user_pass = passwd_script.group(1)
+                if user_pass:
+                    username, password = user_pass.split(":", 1)
                 # 创建Node记录
                 node_db = NodeInfo()
                 node_db.id = str(uuid.uuid4())
@@ -2490,15 +2506,23 @@ def add_existing_nodes(self, cluster_id, server_details):
                 node_db.cluster_name = cluster_name
                 node_db.name = f"{cluster_name}-existing-node-{i+1}"
                 node_db.role = "worker"  # 默认作为worker节点
-                node_db.status = "adding"
+                node_db.status = "joining"
                 node_db.cpu = server_detail.get("flavor", {}).get("vcpus", 0)
                 node_db.mem = server_detail.get("flavor", {}).get("ram", 0) // 1024  # MB转GB
                 node_db.disk = server_detail.get("flavor", {}).get("disk", 0)
                 node_db.gpu = 0  # 默认为0，可根据需要扩展
                 node_db.region = cluster_db.region_name
+                node_db.password = password
+                node_db.user = username
                 node_db.create_time = datetime.now()
                 node_db.update_time = datetime.now()
                 node_db.node_type = "vm"
+                admin_address = ""
+                addresses = server_detail.get("addresses", {})
+                for network_name, ips in addresses.items():
+                    if isinstance(ips, list) and ips:
+                        admin_address = ips[0].get("addr")
+                node_db.admin_address = admin_address
                 node_db.image = server_detail.get("image", {}).get("id", "")
                 session.add(node_db)
                 
@@ -2511,7 +2535,7 @@ def add_existing_nodes(self, cluster_id, server_details):
                 instance_db.name = server_detail.get("name", f"existing-server-{i+1}")
                 instance_db.server_id = server_detail.get("id")
                 instance_db.node_type = "vm"
-                instance_db.status = "adding"
+                instance_db.status = "joining"
                 instance_db.region = cluster_db.region_name
                 instance_db.flavor_id = server_detail.get("flavor", {}).get("id", "")
                 instance_db.image_id = server_detail.get("image", {}).get("id", "")
@@ -2532,6 +2556,7 @@ def add_existing_nodes(self, cluster_id, server_details):
             
         # 7. 生成节点主机名列表（用于Ansible playbook）
         node_names = []
+        index = 1
         for ni in node_instances:
             # 从服务器详情中获取IP地址
             addresses = ni["server_detail"].get("addresses", {})
@@ -2545,11 +2570,14 @@ def add_existing_nodes(self, cluster_id, server_details):
                     break
                     
             if ip_address:
-                node_names.append(f"{ni['instance'].name}:{ip_address}")
-        
+                node_names.append(f"{cluster_db.name}-existing-node-{index}:{ip_address}")
+                index += 1
+
         # 8. 执行Ansible扩容
         if node_names:
+            os.environ['CURRENT_CLUSTER_DIR']=cluster_dir
             scale_nodes = ",".join([name.split(":")[0] for name in node_names])
+            print("准备扩容的节点: %s", scale_nodes)
             ansible_result = scale_kubernetes(cluster_id, scale_nodes, task_id)
             
             if not ansible_result[0]:

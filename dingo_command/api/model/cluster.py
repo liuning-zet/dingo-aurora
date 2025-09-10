@@ -4,7 +4,7 @@ from sqlalchemy import  DateTime
 
 from pydantic import BaseModel, Field
 from dingo_command.api.model.base import DingoopsObject
-
+from dingo_command.api.model.chart import AppChartObject
     
 class NetworkConfigObject(BaseModel):
     admin_subnet_id: Optional[str] = Field(None, description="管理网id")
@@ -31,7 +31,7 @@ class NodeConfigObject(BaseModel):
     image: Optional[str] = Field(None, description="用户id")
     flavor_id: Optional[str] = Field(None, description="节点规格")
     key_id: Optional[str] = Field(None, description="node在openstack中的id")
-    #private_key: Optional[str] = Field(None, description="node在openstack中的id")
+    private_key: Optional[str] = Field(None, description="私钥")
     user: Optional[str] = Field("root", description="node在openstack中的id")
     password: Optional[str] = Field(None, description="node在openstack中的id")
     auth_type: Optional[str] = Field(None, description="鉴权方式")
@@ -91,7 +91,7 @@ class ClusterObject(DingoopsObject):
     forward_float_ip_id: Optional[str] = Field(None, description="集群浮动ip的id")
     forward_float_ip: Optional[str] = Field(None, description="集群浮动ip")
     port_forwards: Optional[List[PortForwards]] = Field(None, description="端口转发配置")
-    charts: Optional[List[PortForwards]] = Field(None, description="端口转发配置")
+    charts: Optional[List[AppChartObject]] = Field(None, description="应用图表配置")
 
 
 class NodeObject(DingoopsObject):
@@ -128,6 +128,7 @@ class ClusterTFVarsObject(BaseModel):
     cluster_name: Optional[str] = Field(None, description="集群id")
     image_uuid: Optional[str] = Field(None, description="用户id")
     nodes: Optional[Dict[str, NodeGroup]] = Field(None, description="集群状态")
+    masters: Optional[Dict[str, NodeGroup]] = Field(None, description="集群状态")
     admin_subnet_id: Optional[str] = Field(None, description="管理子网id")
     bus_network_id: Optional[str] = Field(None, description="业务网络id")
     admin_network_id: Optional[str] = Field(None, description="管理网id")
@@ -168,3 +169,11 @@ class NodeRemoveObject(BaseModel):
 class ScaleNodeObject(BaseModel):
     id: Optional[str] = Field(None, description="集群名称")
     node_config: Optional[List[NodeConfigObject]] = Field(None, description="节点配置")
+
+class ExistingNodeObject(BaseModel):
+    id: Optional[str] = Field(None, description="集群名称")
+    key_id: Optional[str] = Field(None, description="node在openstack中的id")
+    private_key: Optional[str] = Field(None, description="私钥")
+    user: Optional[str] = Field("root", description="node在openstack中的id")
+    password: Optional[str] = Field(None, description="node在openstack中的id")
+    auth_type: Optional[str] = Field(None, description="鉴权方式")
