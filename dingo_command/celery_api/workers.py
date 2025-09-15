@@ -268,6 +268,13 @@ def create_infrastructure(cluster:ClusterTFVarsObject, task_info:Taskinfo, scale
         
 
         cluster.group_vars_path = os.path.join(cluster_dir, "group_vars")
+
+        # 确保 masters 和 nodes 不为 None
+        if cluster.masters is None:
+            cluster.masters = {}
+        if cluster.nodes is None:
+            cluster.nodes = {}
+
         tfvars_str = json.dumps(cluster, default=lambda o: o.__dict__, indent=2)
         
         with open("output.tfvars.json", "w") as f:
@@ -1451,10 +1458,11 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
         query_params["id"] = cluster_dict["id"]
         count, db_clusters = ClusterSQL.list_cluster(query_params)
         c = db_clusters[0]
-        kube_info = json.loads(c.kube_info)
-        kube_info["kube_config"] = kube_config
-        kube_info["kube_lb_address"] = lb_ip
-        c.kube_info = json.dumps(kube_info)
+        if not scale:
+            kube_info = json.loads(c.kube_info)
+            kube_info["kube_config"] = kube_config
+            kube_info["kube_lb_address"] = lb_ip
+            c.kube_info = json.dumps(kube_info)
         c.status = 'running'
         if not scale:
             update_cluster_node_count(len([node for node in node_list if node.get("role") != "master"]), c)
@@ -1711,6 +1719,13 @@ def delete_cluster(self, cluster_id, token):
         tfvars_path = os.path.join(WORK_DIR, "ansible-deploy", "inventory", cluster_id, "terraform", "output.tfvars.json")
         cluster_tfvars = load_tfvars_to_object(tfvars_path)
         cluster_tfvars.token = token
+
+        # 确保 masters 和 nodes 不为 None
+        if cluster_tfvars.masters is None:
+            cluster_tfvars.masters = {}
+        if cluster_tfvars.nodes is None:
+            cluster_tfvars.nodes = {}
+
         tfvars_str = json.dumps(cluster_tfvars, default=lambda o: o.__dict__, indent=2)
         with open("output.tfvars.json", "w") as f:
             f.write(tfvars_str)
