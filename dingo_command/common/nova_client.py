@@ -1,6 +1,7 @@
 # dingo-command的nova的client
 import requests
 import json
+import time
 from fastapi import HTTPException
 from dingo_command.common import CONF
 
@@ -80,9 +81,9 @@ class NovaClient:
         raise Exception(f"未找到服务: {service_type}")
 
     # 添加Nova服务调用
-    def nova_list_servers(self):
+    def nova_list_servers(self, params=None):
         endpoint = self.get_service_endpoint('compute')
-        response = self.session.get(f"{endpoint}/servers")
+        response = self.session.get(f"{endpoint}/servers/detail", params=params)
         if response.status_code != 200:
             raise Exception(f"nova请求失败: {response.text}")
         return response.json()['servers']
@@ -197,3 +198,117 @@ class NovaClient:
         controller_binaries = {"nova-scheduler", "nova-conductor", "nova-api"}
         controller_hosts = set(s['host'] for s in services if s['binary'] in controller_binaries)
         return list(controller_hosts)
+
+    def get_flavor_info(self, flavor_id):
+        """获取 flavor 的详细信息"""
+        try:
+            flavor = self.nova_get_flavor(flavor_id)
+
+            if not flavor:
+                return 0, 0, 0, 0
+
+            cpu = flavor.get('vcpus', 0)
+            mem = flavor.get('ram', 0)
+            disk = flavor.get('disk', 0)
+            gpu = self._extract_gpu_count_from_flavor(flavor)
+
+            return int(cpu), int(gpu), int(mem), int(disk)
+
+        except Exception as e:
+            print(f"获取 flavor {flavor_id} 信息失败: {e}")
+            return 0, 0, 0, 0
+
+    def _extract_gpu_count_from_flavor(self, flavor):
+        """从 flavor 中提取 GPU 数量"""
+        gpu_count = 0
+
+        if not flavor or "extra_specs" not in flavor:
+            return gpu_count
+
+        extra_specs = flavor["extra_specs"]
+
+        # 方法1: 通过 pci_passthrough:alias 获取VM中的GPU（优先级最高）
+        if "pci_passthrough:alias" in extra_specs:
+            pci_alias = extra_specs["pci_passthrough:alias"]
+            try:
+                if ':' in pci_alias:
+                    gpu_str = pci_alias.split(':')[1]
+                    gpu_count = int(gpu_str)
+                    return gpu_count
+            except (ValueError, IndexError):
+                pass
+
+        # 方法2: 通过 resources:GPU 获取裸金属的GPU数量
+        # 格式: h200:8 -> 8
+        if "resources:GPU" in extra_specs:
+            gpu_value = extra_specs["resources:GPU"]
+            try:
+                if ':' in str(gpu_value):
+                    gpu_count = int(str(gpu_value).split(':')[1])
+                    return gpu_count
+                else:
+                    # 直接是数字的情况
+                    gpu_count = 8
+                    return gpu_count
+            except (ValueError, IndexError, TypeError):
+                pass
+        return gpu_count
+    
+    def nova_server_interfaces_list(self, server_id):
+        """获取虚拟机的网络接口列表"""
+        endpoint = self.get_service_endpoint('compute')
+        response = self.session.get(f"{endpoint}/servers/{server_id}/os-interface")
+        if response.status_code != 200:
+            raise Exception(f"获取虚拟机网络接口失败: {response.text}")
+        return response.json().get('interfaceAttachments', [])
+
+    def get_image_info(self, image_id):
+        """获取镜像信息"""
+        try:
+            image = self.glance_get_image(image_id)
+
+            if not image:
+                return ""
+
+            # 按优先级获取操作系统信息
+            if image.get("os_version"):
+                return image.get("os_version")
+            elif image.get("os_distro"):
+                return image.get("os_distro")
+            else:
+                return image.get("name", "")
+
+        except Exception as e:
+            print(f"获取镜像 {image_id} 信息失败: {e}")
+            return ""
+
+# 全局 NovaClient 实例
+_global_nova_client = None
+_last_token_check = None
+TOKEN_CHECK_INTERVAL = 300  # 5分钟检查一次
+
+def get_global_nova_client():
+    """获取全局 NovaClient 实例（支持 Token 刷新）"""
+    global _global_nova_client, _last_token_check
+
+    current_time = time.time()
+
+    # 如果没有实例，或者需要检查 Token
+    if (_global_nova_client is None or
+        _last_token_check is None or
+        current_time - _last_token_check > TOKEN_CHECK_INTERVAL):
+
+        try:
+            # 创建新实例（会自动重新认证）
+            _global_nova_client = NovaClient()
+            _last_token_check = current_time
+        except Exception as e:
+            # 如果创建失败，返回旧实例（如果有的话）
+            if _global_nova_client is None:
+                raise e
+            print(f"重新认证失败，使用旧实例: {e}")
+
+    return _global_nova_client
+
+# 创建全局单例实例
+nova_client = get_global_nova_client()

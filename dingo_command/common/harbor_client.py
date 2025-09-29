@@ -199,6 +199,16 @@ class HarborAPI:
             self._auth = (self.config["robot_username"], self.config["robot_token"])
         else:
             raise ValueError(f"不支持的认证方式: {auth_type}")
+    # 请求
+    def request(self, method, url, **kwargs):
+        return requests.request(
+            method,
+            url,
+            auth=self._auth,
+            headers={"Content-Type": "application/json"},
+            # verify=False,
+            **kwargs,
+        )
 
     def return_response(
         self, status: bool, code: int, message: str, data: Any = None
@@ -266,65 +276,6 @@ class HarborAPI:
             "message": message,
             "data": data,
         }
-
-    # 请求
-    def request(self, method: str, url: str, **kwargs) -> requests.Response:
-        """
-        发送HTTP请求到Harbor API
-
-        这是一个底层的HTTP请求方法，自动处理认证、请求头和SSL验证等配置。
-        所有其他API方法都通过此方法发送请求。
-
-        Args:
-            method (str): HTTP请求方法
-                - 支持的方法：GET, POST, PUT, DELETE, PATCH
-                - 示例：'GET', 'POST', 'PUT', 'DELETE'
-
-            url (str): 请求的完整URL
-                - 可以是相对路径或绝对路径
-                - 相对路径会自动添加base_url前缀
-                - 示例：'/api/v2.0/users', 'https://harbor.example.com/api/v2.0/users'
-
-            **kwargs: 传递给requests.request的其他参数
-                - json: JSON数据（自动设置Content-Type）
-                - params: URL查询参数
-                - headers: 自定义请求头
-                - timeout: 请求超时时间
-                - 其他requests库支持的参数
-
-        Returns:
-            requests.Response: HTTP响应对象
-                - status_code: HTTP状态码
-                - json(): 解析JSON响应
-                - text: 响应文本内容
-                - headers: 响应头信息
-
-        Example:
-            # GET请求
-            response = client.request('GET', '/api/v2.0/users')
-            users = response.json()
-
-            # POST请求
-            user_data = {"username": "test", "email": "test@example.com"}
-            response = client.request('POST', '/api/v2.0/users', json=user_data)
-
-            # 带查询参数的请求
-            response = client.request('GET', '/api/v2.0/projects', params={'page': 1, 'page_size': 10})
-
-        Note:
-            - 自动添加认证信息到请求头
-            - 自动设置Content-Type为application/json
-            - SSL验证默认关闭（verify=False）
-            - 支持所有requests库的高级功能
-        """
-        return requests.request(
-            method,
-            url,
-            auth=self._auth,
-            headers={"Content-Type": "application/json"},
-            verify=False,
-            **kwargs,
-        )
 
     # 创建用户
     def create_user(
@@ -507,6 +458,17 @@ class HarborAPI:
         except Exception as e:
             return self.return_response(False, 500, f"获取所有用户异常: {str(e)}")
 
+    def get_project_quotas(self, project_id: str) -> Dict[str, Any]:
+        """
+        获取指定项目的存储配额信息
+        """
+        try:
+            url = f"{self.base_url}/api/v2.0/quotas?reference_id={project_id}"
+            response = self.request("GET", url)
+            return self.return_response(True, response.status_code, '获取指定项目配额成功', response.json())
+        except Exception as e:
+            return self.return_response(False, 500, f"获取指定项目配额异常: {str(e)}")
+
     def get_all_quotas(self) -> Dict[str, Any]:
         """
         获取Harbor中所有项目的存储配额信息
@@ -561,7 +523,7 @@ class HarborAPI:
             page_size = 100
             all_quotas = []
             while True:
-                url = f"{self.base_url}/api/v2.0/quotas?page={page}&page_size={page_size}"
+                url = f"{self.base_url}/api/v2.0/quotas?page={page}&page_size={page_size}&reference=project"
                 response = self.request("GET", url)
                 response.raise_for_status()
                 data = response.json()
@@ -573,86 +535,25 @@ class HarborAPI:
                     True, 200, "获取项目配额成功", all_quotas
                 )
         except Exception as e:
-            return self.return_response(False, 500, f"异常: {str(e)}")
-
-
-    def get_project_quotas(self, quota_id: int) -> Dict[str, Any]:
-        """
-        获取指定项目的存储配额详细信息
-
-        该方法会查询指定配额ID对应的项目存储配额配置，包括存储限制、
-        已使用量、创建时间等详细信息。
-
-        Args:
-            quota_id (int): 配额ID
-                - 必须是有效的配额ID
-                - 可以通过get_all_quotas方法获取
-                - 示例：123, 456
-
-        Returns:
-            Dict[str, Any]: 包含配额信息的响应字典
-                - status (bool): 操作是否成功
-                - code (int): HTTP状态码
-                - message (str): 操作结果描述
-                - data (dict): 配额详细信息，包含：
-                    - id (int): 配额ID
-                    - ref (dict): 引用信息
-                        - name (str): 项目名称
-                        - owner_name (str): 所有者名称
-                    - hard (dict): 硬限制
-                        - storage (int): 存储限制（字节）
-                    - used (dict): 已使用量
-                        - storage (int): 已使用存储（字节）
-                    - creation_time (str): 创建时间
-                    - update_time (str): 更新时间
-
-        Raises:
-            Exception: 当API调用失败时抛出异常
-
-        Example:
-            # 获取指定项目的配额信息
-            result = harbor_client.get_project_quotas(123)
-
-            if result["status"]:
-                quota = result["data"]
-                project_name = quota['ref']['name']
-                hard_gb = quota['hard']['storage'] / (1024**3) if quota['hard']['storage'] else 0
-                used_gb = quota['used']['storage'] / (1024**3) if quota['used']['storage'] else 0
-                print(f"项目: {project_name}")
-                print(f"存储限制: {hard_gb:.2f} GB")
-                print(f"已使用: {used_gb:.2f} GB")
-            else:
-                print(f"获取失败: {result['message']}")
-
-        Note:
-            - 配额ID必须通过get_all_quotas方法获取
-            - 存储大小以字节为单位，需要自行转换为GB
-            - 如果项目没有设置存储限制，hard字段可能为空
-            - 建议先调用get_all_quotas获取配额列表
-        """
-        try:
-            url = f"{self.base_url}/api/v2.0/quotas/{quota_id}"
-            response = self.request("GET", url)
-            return self.return_response(
-                True, response.status_code, "获取指定项目配额成功", response.json()
-            )
-        except Exception as e:
-            return self.return_response(False, 500, f"获取指定项目配额异常: {str(e)}")
+            return self.return_response(False, 500, f"获取项目配额异常异常: {str(e)}")
 
     def get_project_repositories(
-        self, project_name: str, page: int = 1, page_size: int = 100
+        self, project_name: str, page: int = 1, page_size: int = 100, get_all: bool = False
     ) -> Dict[str, Any]:
         """
         获取指定项目下的所有镜像仓库信息
 
         该方法会查询指定项目中的所有镜像仓库，返回仓库的基本信息、
-        标签数量、创建时间等详细信息。支持分页查询。
+        标签数量、创建时间等详细信息。该方法会自动遍历所有页面，
+        获取项目下的全部仓库数据，忽略传入的page和page_size参数。
 
         Args:
             project_name (str): 项目名称
                 - 必须是已存在的项目名称
                 - 项目名称区分大小写
                 - 示例：'k8s', 'my-project'
+            page (int): 起始页码（此参数被忽略，始终从第1页开始）
+            page_size (int): 每页大小（此参数被忽略，内部固定为100）
 
         Returns:
             Dict[str, Any]: 包含仓库信息的响应字典
@@ -687,21 +588,35 @@ class HarborAPI:
                 print(f"获取失败: {result['message']}")
 
         Note:
-            - 默认返回前100个仓库（page_size=100）
+            - 该方法会自动获取项目下的所有仓库，不受page和page_size参数影响
+            - 内部使用分页机制（每页100条）循环获取所有数据
             - 仓库名称包含项目前缀，如'k8s/nginx'
             - 如果项目不存在或没有仓库，返回空列表
             - 建议结合get_repository_artifacts获取详细标签信息
         """
         try:
-            url = f"{self.base_url}/api/v2.0/projects/{project_name}/repositories?page={page}&page_size={page_size}"
-            response = self.request("GET", url)
-            if response.status_code == 200:
+            if get_all:
+                all_repositories = []
+                while True:
+                    url = f"{self.base_url}/api/v2.0/projects/{project_name}/repositories?page={page}&page_size={page_size}"
+                    response = self.request("GET", url)
+                    if response.status_code == 200:
+                        all_repositories.extend(response.json())
+                        page += 1
+                        if len(response.json()) < page_size:
+                            break
+                    else:
+                        return self.return_response(
+                            False, response.status_code, "获取项目下所有镜像失败", response.json()
+                        )
                 return self.return_response(
-                    True, response.status_code, "获取项目下所有镜像成功", response.json()
+                    True, 200, "获取项目下所有镜像成功", all_repositories
                 )
             else:
+                url = f"{self.base_url}/api/v2.0/projects/{project_name}/repositories?page={page}&page_size={page_size}"
+                response = self.request("GET", url)
                 return self.return_response(
-                    False, response.status_code, "获取项目下所有镜像失败", response.json()
+                    True, 200, "获取项目下所有镜像成功", response.json()
                 )
         except Exception as e:
             return self.return_response(False, 500, f"获取项目下所有镜像异常: {str(e)}")
@@ -860,12 +775,25 @@ class HarborAPI:
         except Exception as e:
             return self.return_response(False, 500, f"仓库镜像删除异常: {str(e)}")
 
+    def search(self,q: str) -> Dict[str, Any]:
+        """
+        搜索Harbor中的项目和仓库
+        """
+        try:
+            url = f"{self.base_url}/api/v2.0/search?q={q}"
+            response = self.request("GET", url)
+            return self.return_response(
+                True, response.status_code, "搜索项目和仓库成功", response.json()
+            )
+        except Exception as e:
+            return self.return_response(False, 500, f"搜索项目和仓库异常: {str(e)}")
+
     def get_projects(self) -> Dict[str, Any]:
         """
         获取Harbor中所有项目的基本信息
 
         该方法会查询系统中所有项目的列表，返回项目的基本信息包括
-        项目名称、ID、公开性、创建时间等。支持分页查询。
+        项目名称、ID、公开性、创建时间等。自动分页获取所有数据。
 
         Returns:
             Dict[str, Any]: 包含项目列表的响应字典
@@ -904,15 +832,38 @@ class HarborAPI:
         Note:
             - 返回所有用户有权限访问的项目
             - 项目按创建时间倒序排列
-            - 如果项目数量很多，建议使用分页参数
+            - 自动分页获取所有数据，无需手动分页
             - 公开项目所有用户都可以访问
             - 私有项目只有成员可以访问
         """
         try:
-            url = f"{self.base_url}/api/v2.0/projects"
-            response = self.request("GET", url)
+            all_projects = []
+            page = 1
+            page_size = 100  # 每页获取100条数据，减少请求次数
+            
+            while True:
+                url = f"{self.base_url}/api/v2.0/projects?page={page}&page_size={page_size}"
+                response = self.request("GET", url)
+                if response.status_code != 200:
+                    return self.return_response(
+                        False, response.status_code, f"获取仓库第{page}页失败", response.text
+                    )
+                
+                data = response.json()
+                
+                if not data:  # 如果没有更多数据，退出循环
+                    break
+                    
+                all_projects.extend(data)
+                
+                # 如果返回的数据少于page_size，说明已经是最后一页
+                if len(data) < page_size:
+                    break
+                    
+                page += 1
+            
             return self.return_response(
-                True, response.status_code, "获取所有项目成功", response.json()
+                True, 200, f"获取所有项目成功，共{len(all_projects)}个项目", all_projects
             )
         except Exception as e:
             return self.return_response(False, 500, f"获取所有项目异常: {str(e)}")
@@ -986,6 +937,20 @@ class HarborAPI:
         except Exception as e:
             return self.return_response(False, 500, f"获取项目信息异常: {str(e)}")
 
+    def get_project_summary(self, project_name: str) -> Dict[str, Any]:
+        """
+        获取指定项目的概览信息
+        """
+        try:
+            url = f"{self.base_url}/api/v2.0/projects/{project_name}/summary"
+            response = self.request("GET", url)
+            return self.return_response(
+                True, response.status_code, "获取项目概览信息成功", response.json()
+            )
+        except Exception as e:
+            return self.return_response(False, 500, f"获取项目概览信息异常: {str(e)}")
+
+    # 获取项目成员
     def get_project_members(self, project_name: str) -> Dict[str, Any]:
         """
         获取指定项目的所有成员信息
@@ -1038,7 +1003,7 @@ class HarborAPI:
             - 建议结合add_project_member管理项目成员
         """
         try:
-            url = f"{self.base_url}/api/v2.0/projects/{project_name}/members"
+            url = f"{self.base_url}/api/v2.0/projects/{project_name}/members?page=1&page_size=10"
             response = self.request("GET", url)
             if response.status_code == 200:
                 return self.return_response(
@@ -1223,7 +1188,7 @@ class HarborAPI:
                 "with_tag": "true",
                 "with_scan_overview": "false",
                 "with_sbom_overview": "false",
-                "with_label": "false",
+                "with_label": "true",
                 "with_immutable_status": "false",
                 "with_accessory": "false",
                 "page_size": 100,
@@ -1379,7 +1344,7 @@ class HarborAPI:
                     "metadata": {
                         "public": f"{public}",
                     },
-                    "storage_limit": storage_limit * 1024 * 1024 * 1024,
+                    "storage_limit": storage_limit,
                 },
             )
             if response.status_code == 201:
@@ -1467,17 +1432,14 @@ class HarborAPI:
         try:
             # 更新是否公开
             url = f"{self.base_url}/api/v2.0/projects/{project_name}"
-            response = self.request(
-                "PUT",
-                url,
-                json={
-                    "project_name": f"{project_name}",
-                    "public": bool(public),
-                    "metadata": {
-                        "public": f"{public}",
-                    },
+            payload = {
+                "project_name": f"{project_name}",
+                "public": True if public == 'true' else False,
+                "metadata": {
+                    "public": 'true' if public == 'true' else 'false',
                 },
-            )
+            }
+            response = self.request("PUT", url, json=payload)
             if response.status_code == 200:
                 return self.return_response(
                     True,
@@ -1563,3 +1525,102 @@ class HarborAPI:
                 )
         except Exception as e:
             return self.return_response(False, 500, f"删除自定义镜像仓库异常: {str(e)}")
+
+    # 删除自定义仓库镜像TAG
+    def delete_custom_projects_images_tag(self, project_name: str, repository_name: str,digest: str) -> Dict[str, Any]:
+        if "/" in repository_name:
+            encoded_repo = quote(quote(repository_name, safe=""), safe="")
+        else:
+            encoded_repo = repository_name
+
+        try:
+            url = f"{self.base_url}/api/v2.0/projects/{project_name}/repositories/{encoded_repo}/artifacts/{digest}"
+            response = self.request("DELETE", url)
+            if response.status_code == 200:
+                return self.return_response(
+                    True,
+                    response.status_code,
+                    f"自定义镜像仓库Tag删除成功: {repository_name}",
+                )
+            else:
+                return self.return_response(
+                    False,
+                    response.status_code,
+                    f"自定义镜像仓库Tag删除失败: {repository_name}",
+                    response.json().get("errors", "未知错误"),
+                )
+        except Exception as e:
+            return self.return_response(False, 500, f"删除自定义镜像仓库异常: {str(e)}")
+
+    # 获取项目标签
+    def get_public_projects_labels(self, project_id: int, page: int = 1, page_size: int = 100, get_all: bool = False) -> Dict[str, Any]:
+        try:
+            if get_all:
+                all_labels = []
+                while True:
+                    url = f"{self.base_url}/api/v2.0/labels"
+                    response = self.request("GET", url, params={"page": page, "page_size": page_size, "project_id": project_id,"scope":"p"})
+                    if response.status_code == 200:
+                        all_labels.extend(response.json())
+                        if len(response.json()) < page_size:
+                            break
+                        page += 1
+                return self.return_response(
+                    True,
+                    response.status_code,
+                    "获取项目标签成功",
+                    all_labels,
+                )
+            else:   
+                url = f"{self.base_url}/api/v2.0/labels"
+                response = self.request("GET", url, params={"page": page, "page_size": page_size, "project_id": project_id,"scope":"p"})
+                if response.status_code == 200:
+                    return self.return_response(
+                        True,
+                        response.status_code,
+                        "获取项目标签成功",
+                        response.json(),
+                    )
+                else:
+                    return self.return_response(
+                        False,
+                        response.status_code,
+                        "获取项目标签失败",
+                        response.json(),
+                    )
+        except Exception as e:
+            return self.return_response(False, 500, f"获取项目标签异常: {str(e)}")
+    
+    # 获取用户ID
+    def get_user_id(self, username: str) -> Dict[str, Any]:
+        try:
+            url = f"{self.base_url}/api/v2.0/users"
+            response = self.request("GET", url, params={"username": username})
+            if response.status_code == 200:
+                return self.return_response(
+                    True,
+                    response.status_code,
+                    "获取用户ID成功",
+                    response.json(),
+                )
+            else:
+                return self.return_response(
+                    False,
+                    response.status_code,
+                    "获取用户ID失败",
+                    response.json(),
+                )
+        except Exception as e:
+            return self.return_response(False, 500, f"获取用户ID异常: {str(e)}")
+    
+    # 修改用户密码
+    def update_user_password(self, user_id: int, old_password: str, new_password: str) -> Dict[str, Any]:
+        try:
+            url = f"{self.base_url}/api/v2.0/users/{user_id}/password"
+            response = requests.put(url, auth=('admin','Zetyun2024'),json={"old_password": old_password, "new_password": new_password},verify=False)
+            if response.status_code == 200:
+                return self.return_response(True, response.status_code, "修改用户密码成功", '')
+            else:
+                return self.return_response(False, response.status_code, "修改用户密码失败", response.json())
+        except Exception as e:
+            return self.return_response(False, 500, f"修改用户密码异常: {str(e)}")

@@ -4,9 +4,10 @@ import uuid
 # k8s kubeconfig指定存放目录
 KUBECONFIG_DIR_DEFAULT = "/home/dingo-command/kubeconfig/"
 #容器实例命名空间前缀
-CCI_NAMESPACE_PREFIX = "ns-"
+CCI_NAMESPACE_PREFIX = "cci-"
 CCI_STS_PREFIX = "cci-"
 CCI_STS_POD_SUFFIX = "-0"
+CCI_SHARE_METALLB = "cci"
 #用户公钥存放configmap的前缀
 CONFIGMAP_PREFIX = "cm-ssh-key-"
 #容器实例系统盘默认挂载路径
@@ -26,11 +27,25 @@ PRODUCT_TYPE_CCI = "CCI"
 APP_LABEL = "app"
 #jupyter开发工具
 DEV_TOOL_JUPYTER = "jupyter"
-INGRESS_SUFFIX = "ingress"
+#jupyter config 挂载路径
+JUPYTER_CONFIG_MOUNT_PATH = "/root/.jupyter/jupyter_notebook_config.py"
+JUPYTER_CONFIG_SUB_PATH = "jupyter_notebook_config.py"
+#jupyter config 挂载名称
+JUPYTER_CONFIG_MOUNT_NAME = "jupyter-config"
+CCI_JUPYTER_PREFIX = "cci-jupyter-"
+JUPYTER_INIT_MOUNT_NAME = "init-dir"
+JUPYTER_INIT_MOUNT_PATH = "/anc-init"
+INGRESS_SIGN = "ingress"
 #CCI保存为镜像后缀
 SAVE_TO_IMAGE_CCI_PREFIX = "cci_saving_to_image-"
 GPU_POD_LABEL_KEY = "cci_gpu_pod"
 GPU_POD_LABEL_VALUE = "true"
+POINT_SIGN = "."
+HYPHEN_SIGN  = "-"
+HARBOR_PULL_IMAGE_SUFFIX = "-harbor-pull-image"
+# POD 存储限制注解
+POD_STORAGE_LIMIT_ANNOTATIONS = {"dc.com/quota.xfs.size": "50g"}
+CPU_POD_SLOT_KEY = "dc.com/cpu-pod-slot"
 
 # excel的目录文件
 EXCEL_TEMP_DIR = "/home/dingo_command/temp_excel/"
@@ -128,10 +143,6 @@ GPU_CARD_MAPPING = {
         "original_name": "NVIDIA-H100",
         "gpu_code": "nvidia.com/gpu-h100"
     },
-    "NVIDIA-L40S-PCIE-48G": {
-        "original_name": "NVIDIA-L40S",
-        "gpu_code": "nvidia.com/gpu-l40s"
-    },
     "NVIDIA-H800-NV-80G": {
         "original_name": "NVIDIA-H800",
         "gpu_code": "nvidia.com/gpu-h800"
@@ -143,5 +154,22 @@ GPU_CARD_MAPPING = {
     "NVIDIA-H800E-NV-35G": {
         "original_name": "NVIDIA-H200-MIG",
         "gpu_code": "nvidia.com/mig-h200-1g.35gb"
+    },
+    "NVIDIA-P4-PCIE-8G": {
+        "original_name": "Tesla-P4",
+        "gpu_code": "nvidia.com/gpu-tesla-p4"
+    },
+    "NVIDIA-L40S-PCIE-48G": {
+        "original_name": "NVIDIA-L40S",
+        "gpu_code": "nvidia.com/gpu-l40s"
     }
 }
+
+# cpu超卖倍数
+CPU_OVER_COMMIT = 4
+# 默认cpu最小的cpu的request 0.5核
+MIN_CPU_REQUEST = 0.5
+# cci容器实例操作，需要同步底层k8s的节点信息的 redis的key
+CCI_SYNC_K8S_NODE_REDIS_KEY = "dingo_command_ai_instance_sync_k8s_node_flag"
+
+CCI_TIME_OUT_DEFAULT = 1800

@@ -162,6 +162,10 @@ variable "nodes" {
       })), [])
       netplan_critical_dhcp_interface = optional(string, "")
     }))
+    data_volumes           = optional(list(object({
+      volume_size = number
+      volume_type = string
+    })), [])
   }))
 }
 
@@ -287,3 +291,7 @@ variable "pushgateway_url" {}
 
 variable "pushgateway_user" {}
 variable "pushgateway_pass" {}
+
+variable "pod_cidr" {
+  type = string
+}

@@ -1,5 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from fastapi import Query, Body, Header, Depends
+
+from dingo_command.services.custom_exception import Fail
 from dingo_command.services.harbor import HarborService
 from datetime import datetime
 
@@ -14,11 +16,17 @@ harbor_service = HarborService()
     description="获取公共仓库镜像",
 )
 async def get_public_base_image(
-    project_name: str = Query("anc-public", description="项目名称"),
+    project_name: str = Query("alayanew-public", description="项目名称"),
     public_image_name: str = Query("", description="镜像名称"),
     page: int = Query(1, description="页码"),
     page_size: int = Query(10, description="页数量大小"),
 ):
+    if page_size > 100:
+        return {
+            "status": False,
+            "code": 400,
+            "message": "页数量大小不能大于100",
+        }
     try:
         result = harbor_service.get_public_base_image(
             project_name=project_name,
@@ -39,14 +47,34 @@ async def get_public_base_image(
 # 添加harbor用户
 @router.post("/harbor/user/add", summary="添加harbor用户", description="添加harbor用户")
 async def add_harbor_user(
+    tenant_id: str = Body(..., description="租户id"),
     username: str = Body(..., description="用户名"),
     password: str = Body(..., description="密码"),
-    email: str = Body(..., description="邮箱"),
-    realname: str = Body(..., description="真实姓名"),
-    comment: str = Body(..., description="备注"),
+    email: str = Body("", description="邮箱"),
+    realname: str = Body("", description="真实姓名"),
+    comment: str = Body("", description="备注"),
 ):
     try:
+        if username == "admin" or username == "root":
+            return {
+                "status": False,
+                "code": 400,
+                "message": "用户名不能为admin或root",
+            }
+        elif tenant_id == "" or username == "" or password == "":
+            return {
+                "status": False,
+                "code": 400,
+                "message": "租户ID或用户名或密码为空",
+            }
+        if not email:
+            email = f"{username}@zetyun01.com"
+        if not realname:
+            realname = username
+        if not comment:
+            comment = "接口添加"
         result = harbor_service.add_harbor_user(
+            tenant_id=tenant_id,
             username=username,
             password=password,
             email=email,
@@ -71,14 +99,14 @@ async def add_custom_projects(
     project_name: str = Body(..., description="项目名称"),
     public: str = Body(..., description="是否公开"),
     storage_limit: int = Body(..., description="存储限制"),
-    user_name: str = Body(..., description="用户名"),
+    tenant_id: str = Body(..., description="租户id"),
 ):
     try:
         result = harbor_service.add_custom_projects(
             project_name=project_name,
             public=public,
             storage_limit=storage_limit,
-            user_name=user_name,
+            tenant_id=tenant_id,
         )
         return result
     except Exception as e:
@@ -100,10 +128,11 @@ async def update_custom_projects(
     project_name: str = Body(..., description="项目名称"),
     public: str = Body(..., description="是否公开"),
     storage_limit: int = Body(..., description="存储限制"),
+    tenant_id: str = Body(..., description="租户id"),
 ):
     try:
         result = harbor_service.update_custom_projects(
-            project_name=project_name, public=public, storage_limit=storage_limit
+            project_name=project_name, public=public, storage_limit=storage_limit, tenant_id=tenant_id
         )
         return result
     except Exception as e:
@@ -122,10 +151,10 @@ async def update_custom_projects(
     description="获取自定义镜像仓库",
 )
 async def get_custom_projects(
-    user_name: str = Query(..., description="用户名"),
+    tenant_id: str = Query(..., description="租户id"),
 ):
     try:
-        result = harbor_service.get_custom_projects(user_name=user_name)
+        result = harbor_service.get_custom_projects(tenant_id=tenant_id,user_name='')
         return result
     except Exception as e:
         import traceback
@@ -143,7 +172,7 @@ async def get_custom_projects(
     description="删除自定义镜像仓库",
 )
 async def delete_custom_projects(
-    project_name: str = Body(..., description="项目名称"),
+    project_name: str = Body(..., embed=True, description="项目名称"),
 ):
     try:
         result = harbor_service.delete_custom_projects(project_name=project_name)
@@ -165,9 +194,11 @@ async def delete_custom_projects(
 )
 async def get_custom_projects_images(
     project_name: str = Query(..., embed=True, description="项目名称"),
+    page: int = Query(1, description="页码"),
+    page_size: int = Query(10, description="页数量大小"),
 ):
     try:
-        result = harbor_service.get_custom_projects_images(project_name=project_name)
+        result = harbor_service.get_custom_projects_images(project_name=project_name, page=page, page_size=page_size)
         return result
     except Exception as e:
         import traceback
@@ -200,3 +231,158 @@ async def delete_custom_projects_images(
         raise HTTPException(
             status_code=400, detail=f"delete custom projects images error: {str(e)}"
         )
+
+# 删除自定义镜像仓库镜像TAG
+@router.post(
+    "/harbor/custom/project/images/tag/delete",
+    summary="删除自定义镜像仓库镜像TAG",
+    description="删除自定义镜像仓库镜像TAG",
+)
+async def delete_custom_projects_images_tag(
+    project_name: str = Body(..., description="项目名称"),
+    repository_name: str = Body(..., description="镜像仓库名称"),
+    digest: str = Body(..., description="镜像TAG"),
+):  
+    try:
+        result = harbor_service.delete_custom_projects_images_tag(
+            project_name=project_name, repository_name=repository_name, digest=digest
+        )
+        return result
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=f"delete custom projects images tag error: {str(e)}")
+
+# 获取项目标签
+@router.get(
+    "/harbor/public/project/labels/list",
+    summary="获取项目标签",
+    description="获取项目标签",
+)
+async def get_public_projects_labels(
+    project_name: str = Query('alayanew-public', description="项目名称"),
+    page: int = Query(1, description="页码"),
+    page_size: int = Query(100, description="页数量大小"),
+):
+    try:
+        result = harbor_service.get_public_projects_labels(project_name=project_name, page=page, page_size=page_size)
+        return result
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=f"get public projects labels error: {str(e)}")
+        
+@router.post(
+    "/harbor/custom/service/relation/add",
+    summary="租户私有镜像仓库功能建立关联关系",
+    description="租户私有镜像仓库功能建立关联关系",
+)
+async def add_custom_harbor_relation(
+    tenant_id: str = Body(..., description="租户id"),
+    harbor_name: str = Body(..., description="仓库用户名"),
+    harbor_password: str = Body(..., description="仓库密码"),
+):
+    try:
+        result = harbor_service.add_custom_harbor_relation(
+            tenant_id=tenant_id,
+            harbor_name=harbor_name,
+            harbor_password=harbor_password,
+        )
+        return result
+    except Fail as e:
+        raise HTTPException(status_code=400, detail=e.error_message)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=400, detail=f"open custom harbor error: {str(e)}"
+        )
+
+@router.post(
+    "/harbor/custom/service/relation/{tenant_id}/delete",
+    summary="租户私有镜像仓库功能删除关联关系",
+    description="租户私有镜像仓库功能删除关联关系",
+)
+async def delete_custom_harbor_relation(tenant_id: str,):
+    try:
+        return harbor_service.delete_custom_harbor_relation(tenant_id)
+    except Fail as e:
+        raise HTTPException(status_code=400, detail=e.error_message)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=400, detail=f"open custom harbor error: {str(e)}"
+        )
+
+# 获取自定义镜像仓库镜像
+@router.get(
+    "/harbor/custom/service/relation",
+    summary="获取租户的私有仓库关联信息",
+    description="根据租户id获取租户的私有仓库关联信息",
+)
+async def get_custom_harbor_relation(
+    tenant_id: str = Query("", description="租户id"),
+    harbor_name: str = Query("", description="仓库用户名"),
+):
+    try:
+        if tenant_id:
+            harbor_relation = harbor_service.get_custom_harbor_relation(tenant_id=tenant_id)
+            if harbor_relation:
+                return {
+                    "status": True,
+                    "code": 200,
+                    "message": "查询租户与harbor的关联关系成功",
+                    "data": harbor_relation,
+                }
+            else:
+                return {
+                    "status": False,
+                    "code": 200,
+                    "message": "租户ID不存在",
+                    "data": None,
+                }
+        elif harbor_name:
+            harbor_relation = harbor_service.check_harbor_user(harbor_name=harbor_name)
+            if harbor_relation:
+                return {
+                    "status": True,
+                    "code": 200,
+                    "message": "Harbor用户名已存在",
+                    "data": None,
+                }
+            else:
+                return {
+                    "status": False,
+                    "code": 200,
+                    "message": "Harbor用户名不存在",
+                    "data": None,
+                }
+        else:
+            return {
+                "status": False,
+                "code": 400,
+                "message": "参数错误",
+            }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=400, detail=f"get custom harbor error: {str(e)}"
+        )
+
+# 修改用户密码
+@router.post("/harbor/user/password/update", summary="修改用户密码", description="修改用户密码")
+async def update_user_password(
+    username: str = Body(..., description="用户名"),
+    old_password: str = Body(..., description="旧密码"),
+    new_password: str = Body(..., description="新密码"),
+):
+    try:
+        result = harbor_service.update_user_password(username=username, old_password=old_password, new_password=new_password)
+        return result
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=f"update user password error: {str(e)}")

@@ -13,28 +13,40 @@
 # limitations under the License.
 
 import multiprocessing
+import logging
+import os
+
+# 设置环境变量以控制 Kubernetes 客户端日志级别
+os.environ['KUBERNETES_CLIENT_LOG_LEVEL'] = 'WARNING'
+
+# 关闭 Kubernetes 客户端的详细日志输出
+logging.getLogger('kubernetes.client').setLevel(logging.WARNING)
+logging.getLogger('kubernetes.client.rest').setLevel(logging.WARNING)
+logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
+logging.getLogger('urllib3.util.retry').setLevel(logging.WARNING)
 
 bind = "0.0.0.0:8887"
-workers = (1 + multiprocessing.cpu_count()) // 2
-worker_class = "uvicorn.workers.UvicornWorker"
-timeout = 300
-keepalive = 5
-reuse_port = True
+workers = min(multiprocessing.cpu_count() * 2, 8)  # 平衡性能与资源
+timeout = 600                                      # 充足的操作时间  
+keepalive = 30                                     # 优化连接复用
 proc_name = "dingo-command"
+max_requests = 2000       # K8s操作较重，适当提高以减少重启频率
+max_requests_jitter = 200 # 增加随机性，避免所有worker同时重启
+preload_app = True       # 预加载应用，共享K8s客户端初始化开销
 
 logconfig_dict = {
     "version": 1,
     "disable_existing_loggers": False,
-    "root": {"level": "DEBUG", "handlers": ["console"]},
+    "root": {"level": "INFO", "handlers": ["console"]},
     "loggers": {
         "gunicorn.error": {
-            "level": "DEBUG",
+            "level": "INFO",
             "handlers": ["error_file"],
             "propagate": 0,
             "qualname": "gunicorn_error",
         },
         "gunicorn.access": {
-            "level": "DEBUG",
+            "level": "INFO",
             "handlers": ["access_file"],
             "propagate": 0,
             "qualname": "access",
@@ -53,7 +65,7 @@ logconfig_dict = {
         },
         "console": {
             "class": "logging.StreamHandler",
-            "level": "DEBUG",
+            "level": "INFO",
             "formatter": "generic",
         },
     },

@@ -25,6 +25,7 @@ class AiInstanceApiModel(BaseModel):
     instance_id: Optional[str] = Field(None, description="容器实例ID，由云上服务bs传下来")
     product_code: Optional[str] = Field(None, description="产品Code")
     user_id: Optional[str] = Field(None, description="用户id")
+    is_manager: Optional[bool] = Field(None, description="是否主账号")
     tenant_id: Optional[str] = Field(None, description="租户ID")
     region_id: Optional[str] = Field(None, description="region id")
     k8s_id: Optional[str] = Field(None, description="K8S id")
@@ -68,11 +69,13 @@ class AutoDeleteRequest(BaseModel):
 # 账户创建请求
 class AccountCreateRequest(BaseModel):
     account: str = Field(..., description="账户账号")
-    is_vip: bool = Field(False, description="是否为VIP账户")
+    vip: str = Field(False, description="VIP")
+    metallb_ip: str = Field(False, description="Metallb IP")
 
 class AccountUpdateRequest(BaseModel):
     account: Optional[str] = Field(None, description="账户账号")
     vip: Optional[str] = Field(None, description="VIP")
+    metallb_ip: str = Field(False, description="Metallb IP")
 
 # 开机请求参数
 class StartInstanceModel(BaseModel):
@@ -81,7 +84,7 @@ class StartInstanceModel(BaseModel):
     product_code: Optional[str] = Field(None, description="产品Code")
 
 class AddPortModel(BaseModel):
-    port: int = Field(None, description="服务端口号")
-    target_port: Optional[int] = Field(None, description="容器端口号")
+    port: Optional[int] = Field(None, description="服务端口号")
+    target_port: int = Field(None, description="容器端口号")
     node_port: Optional[int] = Field(None, description="节点端口号")
     protocol: str = Field(None, description="协议类型 TCP")

@@ -1,17 +1,22 @@
+import base64
+import textwrap
+import time
+import logging
 from typing import Dict
 import json
-import time
 
-from kubernetes.client import V1StatefulSet, ApiException, V1Ingress, V1ObjectMeta, V1IngressSpec, V1IngressTLS, \
-    V1IngressRule, V1HTTPIngressRuleValue, V1HTTPIngressPath, V1IngressBackend, V1IngressServiceBackend, \
-    V1ServiceBackendPort, V1ServicePort, V1Service, V1ServiceSpec
+from kubernetes.client import V1StatefulSet, ApiException
 from kubernetes import client
-from oslo_log import log
+from dingo_command.common.common import dingo_print
 
-from dingo_command.utils.constant import RESOURCE_TYPE_KEY, PRODUCT_TYPE_CCI, DEV_TOOL_JUPYTER, CCI_STS_PREFIX, \
-    CCI_STS_POD_SUFFIX, INGRESS_SUFFIX
+from dingo_command.utils.constant import RESOURCE_TYPE_KEY, PRODUCT_TYPE_CCI, DEV_TOOL_JUPYTER, INGRESS_SIGN, \
+    CCI_SHARE_METALLB
 
-LOG = log.getLogger(__name__)
+# 关闭 Kubernetes 客户端的详细日志输出
+logging.getLogger('kubernetes.client').setLevel(logging.WARNING)
+logging.getLogger('kubernetes.client.rest').setLevel(logging.WARNING)
+logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
+
 
 class K8sCommonOperate:
 
@@ -29,9 +34,9 @@ class K8sCommonOperate:
 
             # 2. 创建命名空间
             core_v1.create_namespace(body=namespace)
-            print(f"namespace {namespace_name} create success")
+            dingo_print(f"namespace {namespace_name} create success")
         except Exception as e:
-            print(f"namespace {namespace_name} create failed")
+            dingo_print(f"namespace {namespace_name} create failed")
             import traceback
             traceback.print_exc()
             raise e
@@ -67,8 +72,9 @@ class K8sCommonOperate:
                 body=stateful_set_pod_data,
                 async_req=async_req
             )
+            dingo_print(f"Successfully created sts {namespace_name}/{stateful_set_pod_data.metadata.name}")
         except Exception as e:
-            LOG.info(f"create statefulset pod failed, namespace_name: {namespace_name}, stateful_set_pod_data: {json.dumps(stateful_set_pod_data)}")
+            dingo_print(f"create statefulset pod  {namespace_name}/{stateful_set_pod_data.metadata.name} failed:{e}")
             import traceback
             traceback.print_exc()
             raise e
@@ -77,13 +83,14 @@ class K8sCommonOperate:
         return create_namespaced_stateful_set_pod_thread.get()
 
     def create_cci_jupter_service(self, core_v1: client.CoreV1Api(), namespace: str, service_name: str):
-        """创建ClusterIP Service"""
+        """创建ClusterIP Service (幂等版本)"""
+        full_service_name = service_name + "-" + DEV_TOOL_JUPYTER
         service = client.V1Service(
-            metadata=client.V1ObjectMeta(name=service_name + "-" + DEV_TOOL_JUPYTER,
+            metadata=client.V1ObjectMeta(name=full_service_name,
                                          labels={RESOURCE_TYPE_KEY: PRODUCT_TYPE_CCI}),
             spec=client.V1ServiceSpec(
                 selector={"app": service_name,
-                          RESOURCE_TYPE_KEY: PRODUCT_TYPE_CCI},  # 定义标签
+                          RESOURCE_TYPE_KEY: PRODUCT_TYPE_CCI},
                 ports=[
                     client.V1ServicePort(
                         name=DEV_TOOL_JUPYTER,
@@ -91,119 +98,306 @@ class K8sCommonOperate:
                         target_port=8888,
                         protocol="TCP"
                     )
-                ],  # 定义port、target_port端口号
+                ],
                 type="ClusterIP",
             )
         )
 
         try:
+            # 首先尝试创建
             create_namespaced_service_thread = core_v1.create_namespaced_service(
                 namespace=namespace,
                 body=service,
                 async_req=True
             )
             create_namespaced_service = create_namespaced_service_thread.get()
-            print(f"success create jupter service {create_namespaced_service.metadata.name}")
+            dingo_print(f"Successfully created jupyter service {create_namespaced_service.metadata.name}")
             return create_namespaced_service.metadata.uid
-        except client.exceptions.ApiException as e:
-            print(f"Jupter service {service_name}  cerate failed:{e}")
+
+        except client.rest.ApiException as e:
+            # 如果异常原因是 409 Conflict，则尝试更新已有的 Service
+            if e.status == 409:
+                dingo_print(f"Service '{full_service_name}' already exists, attempting update...")
+                try:
+                    update_namespaced_service_thread = core_v1.replace_namespaced_service(
+                        name=full_service_name,
+                        namespace=namespace,
+                        body=service,
+                        async_req=True
+                    )
+                    updated_service = update_namespaced_service_thread.get()
+                    dingo_print(f"Successfully updated jupyter service {updated_service.metadata.name}")
+                    return updated_service.metadata.uid
+                except Exception as update_e:
+                    dingo_print(f"Failed to update service '{full_service_name}': {update_e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise update_e
+            else:
+                # 如果是其他错误，直接抛出
+                dingo_print(f"Failed to create jupyter service '{full_service_name}': {e}")
+                import traceback
+                traceback.print_exc()
+                raise e
+
+    def create_cci_metallb_service(self, core_v1: client.CoreV1Api, namespace: str, service_name: str,
+                                   cci_service_ip: str, is_account: bool, available_ports_map):
+        """
+        创建带有特定注解的MetalLB Service (幂等版本)
+        """
+        # 定义Service端口
+        ports = [
+            client.V1ServicePort(name="ssh", protocol="TCP", port=available_ports_map['22'], target_port=22),
+            client.V1ServicePort(name="port-9001", protocol="TCP", port=available_ports_map['9001'], target_port=9001),
+            client.V1ServicePort(name="port-9002", protocol="TCP", port=available_ports_map['9002'], target_port=9002)
+        ]
+
+        if is_account:
+            metallb_share = namespace
+        else:
+            metallb_share = CCI_SHARE_METALLB
+
+        # 定义Service的metadata，包含名称、命名空间、标签和关键的MetalLB注解
+        metadata = client.V1ObjectMeta(
+            name=service_name,
+            namespace=namespace,
+            labels={RESOURCE_TYPE_KEY: PRODUCT_TYPE_CCI},
+            annotations={
+                "metallb.universe.tf/allow-shared-ip": metallb_share,
+                "metallb.universe.tf/loadBalancerIPs": cci_service_ip
+            }
+        )
+
+        # 定义Service的spec
+        spec = client.V1ServiceSpec(
+            type="LoadBalancer",
+            allocate_load_balancer_node_ports=False,
+            ports=ports,
+            selector={
+                "app": service_name,
+                RESOURCE_TYPE_KEY: PRODUCT_TYPE_CCI
+            }
+        )
+
+        # 构建Service对象
+        service = client.V1Service(api_version="v1", kind="Service", metadata=metadata, spec=spec)
+
+        try:
+            # 首先尝试创建
+            create_namespaced_service_thread = core_v1.create_namespaced_service(
+                namespace=namespace,
+                body=service,
+                async_req=True
+            )
+            create_namespaced_service = create_namespaced_service_thread.get()
+            dingo_print(f"Successfully created MetalLB service {namespace}/{create_namespaced_service.metadata.name}")
+            return create_namespaced_service.metadata.uid
+
+        except client.rest.ApiException as e:
+            # 如果异常原因是 409 Conflict，则尝试更新已有的 Service
+            if e.status == 409:
+                dingo_print(f"Service '{service_name}' already exists, attempting update...")
+                try:
+                    update_namespaced_service_thread = core_v1.replace_namespaced_service(
+                        name=service_name,
+                        namespace=namespace,
+                        body=service,
+                        async_req=True
+                    )
+                    updated_service = update_namespaced_service_thread.get()
+                    dingo_print(f"Successfully updated MetalLB service {namespace}/{updated_service.metadata.name}")
+                    return updated_service.metadata.uid
+                except Exception as update_e:
+                    dingo_print(f"Failed to update service {namespace}/{service_name}: {update_e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise update_e
+            else:
+                # 如果是其他错误，直接抛出
+                dingo_print(f"Failed to create MetalLB service {namespace}/{service_name}: {e}")
+                import traceback
+                traceback.print_exc()
+                raise e
+        except Exception as e:
+            dingo_print(f"Unexpected error during service creation: {e}")
             import traceback
             traceback.print_exc()
             raise e
 
-    def create_cci_metallb_service(self, core_v1: client.CoreV1Api(), namespace: str, service_name: str, cci_service_ip: str):
+    def create_jupyter_configmap(self, core_v1: client.CoreV1Api, namespace, configmap_name, nb_prefix, nb_init_password):
         """
-        创建带有特定注解的MetalLB Service
+        创建 Jupyter Notebook 配置的 ConfigMap
+
+        参数:
+            namespace (str): Kubernetes 命名空间
+            configmap_name (str): ConfigMap 名称
+            jupyter_config_content (str): Jupyter Notebook 配置文件内容
+        """
+        # 定义ConfigMap数据
+        configmap_data = {
+            "NB_INIT_PASSWORD": nb_init_password,  # 使用传入的变量值
+            "NOTEBOOK_ENABLE_PROXY": "False",
+            "PIP_SOURCE": "nexus",
+            "CONDA_SOURCE": "tsinghua",
+            "APT_SOURCE": "nexus",
+            "NB_PREFIX": nb_prefix
+        }
+
+        # 创建ConfigMap对象
+        configmap = client.V1ConfigMap(
+            api_version="v1",
+            kind="ConfigMap",
+            metadata=client.V1ObjectMeta(
+                name=configmap_name,
+                namespace=namespace
+            ),
+            data=configmap_data
+        )
+
+        try:
+            # 创建 ConfigMap
+            api_response = core_v1.create_namespaced_config_map(
+                namespace=namespace,
+                body=configmap
+            )
+            dingo_print(f" create ConfigMap {namespace}/{configmap_name} succeed")
+            return api_response
+        except client.rest.ApiException as e:
+            # 如果异常原因是 409 Conflict，则尝试更新已有的 ConfigMap
+            if e.status == 409:
+                dingo_print(f"ConfigMap {namespace}/{configmap_name} always exists, to update...")
+                try:
+                    api_response = core_v1.replace_namespaced_config_map(
+                        name=configmap_name,
+                        namespace=namespace,
+                        body=configmap
+                    )
+                    dingo_print(f"ConfigMap {namespace}/{configmap_name} update succeed.")
+                    return api_response
+                except Exception as replace_e:
+                    dingo_print(f"update ConfigMap {namespace}/{configmap_name} failed: {replace_e}")
+                    raise replace_e
+            else:
+                # 如果是其他错误，直接抛出
+                dingo_print(f"create jupyter ConfigMap {namespace}/{configmap_name} failed: {e}")
+                raise e
+        except Exception as e:
+            dingo_print(f"create jupyter ConfigMap[{namespace}/{configmap_name}] failed: {e}")
+            raise e
+
+    def create_configmap(self, core_v1: client.CoreV1Api, namespace, configmap_name, nb_prefix):
+        """
+        创建 Jupyter Notebook 配置的 ConfigMap
+
+        参数:
+            namespace (str): Kubernetes 命名空间
+            configmap_name (str): ConfigMap 名称
+            jupyter_config_content (str): Jupyter Notebook 配置文件内容
         """
         try:
-            # 定义Service端口
-            ports = [
-                V1ServicePort(name="ssh", protocol="TCP", port=22, target_port=22),  # 第一个端口映射
-                V1ServicePort(name="port-9001", protocol="TCP", port=9001, target_port=9001),  # 第二个端口映射
-                V1ServicePort(name="port-9002", protocol="TCP", port=9002, target_port=9002)  # 第三个端口映射
-            ]
+            # Jupyter 配置内容
+            jupyter_config_content = textwrap.dedent(f"""\
+                c = get_config()
+                c.ServerApp.token = ''
+                c.ServerApp.password = ''
+                c.ServerApp.disable_check_xsrf = True
+                c.ServerApp.allow_origin = '*'
+                c.ServerApp.allow_remote_access = True
+                c.ServerApp.base_url = '{nb_prefix}'
+                c.ServerApp.trust_xheaders = True
+                c.ServerApp.allow_root = True
+                """)
 
-            # 定义Service的metadata，包含名称、命名空间、标签和关键的MetalLB注解
-            metadata = V1ObjectMeta(
-                name=service_name,
-                namespace=namespace,
-                labels={RESOURCE_TYPE_KEY: PRODUCT_TYPE_CCI},
-
-                annotations={
-                    "metallb.universe.tf/allow-shared-ip": service_name,  # 共享IP的标识
-                    "metallb.universe.tf/loadBalancerIPs": cci_service_ip  # 指定的固定IP
+            # 定义 ConfigMap 主体
+            configmap_manifest = {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": configmap_name,
+                    "namespace": namespace
+                },
+                "data": {
+                    "jupyter_notebook_config.py": jupyter_config_content  # 配置数据
                 }
-            )
+            }
 
-            # 定义Service的spec
-            spec = V1ServiceSpec(
-                type="LoadBalancer",  # 类型为LoadBalancer，由MetalLB提供实现
-                ports=ports,
-                selector={
-                    "app": service_name,
-                    RESOURCE_TYPE_KEY: PRODUCT_TYPE_CCI
-                },  # 定义标签  # 选择器，指向拥有此标签的Pod
-            )
-
-            # 构建Service对象
-            service = V1Service(api_version="v1", kind="Service", metadata=metadata, spec=spec)
-            # 创建Service
-            create_namespaced_service_thread = core_v1.create_namespaced_service(
+            # 创建 ConfigMap
+            api_response = core_v1.create_namespaced_config_map(
                 namespace=namespace,
-                body=service,
-                async_req=True
+                body=configmap_manifest
             )
-            create_namespaced_service = create_namespaced_service_thread.get()
-            print(f"success create metallb service {create_namespaced_service.metadata.name}")
-            return create_namespaced_service.metadata.uid
+            dingo_print(f" create ConfigMap {namespace}/{configmap_name}, {nb_prefix} succeed")
+            return api_response
+
         except ApiException as e:
-            print(f"创建Metallb Service时发生Kubernetes API异常: {e}")
-            print(f"异常详情: {e.body}")
-        except Exception as e:
-            print(f"创建Service时发生系统异常: {e}")
+            dingo_print(f"create jupyter ConfigMap {namespace}/{configmap_name}, {nb_prefix} failed: {e}")
+            raise e
 
-    def create_cci_ingress_rule(self, networking_v1: client.NetworkingV1Api, instance_id: str, namespace: str, service_name: str, k8s_id: str, region_id: str):
-        """创建Ingress Service"""
+    def delete_configmap(self, core_v1: client.CoreV1Api, namespace, configmap_name):
+        """
+        删除指定的 ConfigMap
+        参数:
+            namespace (str): Kubernetes 命名空间
+            configmap_name (str): 要删除的 ConfigMap 名称
+        """
+        try:
+            # propagation_policy='Background'：Kubernetes 在删除对象后立即返回，并在后台进行垃圾回收
+            # grace_period_seconds=0：尽可能缩短优雅删除期限（对 ConfigMap 可能影响不大，但表明意图）
+            delete_options = client.V1DeleteOptions(
+                propagation_policy='Background',
+                grace_period_seconds=0
+            )
+            api_response = core_v1.delete_namespaced_config_map(
+                name=configmap_name,
+                namespace=namespace,
+                body=delete_options
+            )
+            dingo_print(f"delete ConfigMap {namespace}/{configmap_name} succeed")
+            return api_response
+
+        except ApiException as e:
+            if e.status == 404:
+                dingo_print(f"ConfigMap {namespace}/{configmap_name} not exist")
+            else:
+                dingo_print(f"delete ConfigMap {namespace}/{configmap_name} failed: {e}")
+            raise e
+
+    def create_cci_ingress_rule(self, networking_v1: client.NetworkingV1Api, namespace: str, service_name: str,
+                                host_domain: str, nb_prefix: str):
+        """创建Ingress Service (幂等版本)"""
         # 定义变量
-        ingress_name = f"{service_name}-{INGRESS_SUFFIX}"
+        ingress_name = f"{service_name}-{INGRESS_SIGN}"
         user_cci_pod_service_name = service_name + "-" + DEV_TOOL_JUPYTER  # 替换为实际 jupter Service 名称
-        region_id = "default" if not region_id else region_id  # 替换为实际 region_id, 云上会传过来
-        zone_id = k8s_id  # 替换为实际 zone_id
-        cci_pod_name = service_name + CCI_STS_POD_SUFFIX  # 替换为实际 Pod 名称
-
-        # 构建 Ingress 主机名和路径
-        host = f"{region_id}-{zone_id}.alayanew.com"
-        path = f"/{instance_id}/notebook/jupyter/{namespace}/{cci_pod_name}"
 
         # 创建 Ingress 对象
-        ingress = V1Ingress(
+        ingress = client.V1Ingress(
             api_version="networking.k8s.io/v1",
             kind="Ingress",
-            metadata=V1ObjectMeta(
+            metadata=client.V1ObjectMeta(
                 name=ingress_name,
                 namespace=namespace,
                 annotations={
-                    "nginx.ingress.kubernetes.io/rewrite-target": "/$1",
                     "nginx.ingress.kubernetes.io/ssl-redirect": "true",
-                    "nginx.ingress.kubernetes.io/websocket-services": service_name + "-" + DEV_TOOL_JUPYTER,
+                    "nginx.ingress.kubernetes.io/websocket-services": user_cci_pod_service_name,
                     "nginx.ingress.kubernetes.io/proxy-read-timeout": "3600",
                     "nginx.ingress.kubernetes.io/proxy-send-timeout": "3600",
+                    "nginx.ingress.kubernetes.io/proxy-body-size": "50m",
                 },
             ),
-            spec=V1IngressSpec(
+            spec=client.V1IngressSpec(
                 ingress_class_name="nginx",
                 rules=[
-                    V1IngressRule(
-                        host=host,
-                        http=V1HTTPIngressRuleValue(
+                    client.V1IngressRule(
+                        host=host_domain,
+                        http=client.V1HTTPIngressRuleValue(
                             paths=[
-                                V1HTTPIngressPath(
-                                    path=path,
+                                client.V1HTTPIngressPath(
+                                    path=nb_prefix,
                                     path_type="Prefix",
-                                    backend=V1IngressBackend(
-                                        service=V1IngressServiceBackend(
+                                    backend=client.V1IngressBackend(
+                                        service=client.V1IngressServiceBackend(
                                             name=user_cci_pod_service_name,
-                                            port=V1ServiceBackendPort(number=8888),
+                                            port=client.V1ServiceBackendPort(number=8888),
                                         )
                                     ),
                                 )
@@ -214,15 +408,40 @@ class K8sCommonOperate:
             ),
         )
 
-        # 创建 Ingress
         try:
+            # 首先尝试创建
             api_response = networking_v1.create_namespaced_ingress(
                 namespace=namespace,
                 body=ingress,
             )
-            print(f"Ingress created successfully: {api_response.metadata.name}")
+            dingo_print(f"Ingress created successfully: {api_response.metadata.name}")
+            return api_response
+
+        except client.rest.ApiException as e:
+            # 如果异常原因是 409 Conflict，则尝试更新已有的 Ingress
+            if e.status == 409:
+                dingo_print(f"Ingress '{ingress_name}' already exists, attempting update...")
+                try:
+                    api_response = networking_v1.replace_namespaced_ingress(
+                        name=ingress_name,
+                        namespace=namespace,
+                        body=ingress,
+                    )
+                    dingo_print(f"Ingress updated successfully: {api_response.metadata.name}")
+                    return api_response
+                except Exception as update_e:
+                    dingo_print(f"Failed to update Ingress '{ingress_name}': {update_e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise update_e
+            else:
+                # 如果是其他错误，直接抛出
+                dingo_print(f"Failed to create Ingress '{ingress_name}': {e}")
+                import traceback
+                traceback.print_exc()
+                raise e
         except Exception as e:
-            print(f"Error creating Ingress: {e}")
+            dingo_print(f"Unexpected error during Ingress creation: {e}")
             import traceback
             traceback.print_exc()
             raise e
@@ -273,7 +492,7 @@ class K8sCommonOperate:
         try:
             return core_v1.read_namespaced_pod(name, namespace)
         except Exception as e:
-            print(f"查询 Pod {namespace}/{name} 失败: {e}")
+            dingo_print(f"query pod {namespace}/{name} failed: {e}")
             raise e
 
 
@@ -290,43 +509,81 @@ class K8sCommonOperate:
         try:
             return app_v1.read_namespaced_stateful_set(name, namespace)
         except Exception as e:
-            print(f"查询 Pod {namespace}/{name} 失败: {e}")
+            dingo_print(f"query sts {namespace}/{name} failed: {e}")
             raise e
 
 
     def replace_statefulset(self, apps_v1: client.AppsV1Api, real_name, namespace_name, modified_sts_data):
         """
-        替换 StatefulSet：删除旧的并创建新的。
+        替换 StatefulSet：删除旧的并创建新的，确保旧资源完全清理后再创建。
 
         参数:
-            apps_v1: app client。
+            apps_v1: apps client。
+            core_v1: core client (用于检查Pod)。
             real_name: StatefulSet 的名称。
             namespace_name: 命名空间。
             modified_sts_data: 修改后的 V1StatefulSet 对象。
         """
         try:
-            # 1. 删除 StatefulSet (非级联删除，保留 Pods 和 PVCs)
+            # 1. 删除 StatefulSet (采用默认的级联删除策略，会删除Pod)
             delete_options = client.V1DeleteOptions(grace_period_seconds=0)
             apps_v1.delete_namespaced_stateful_set(
                 name=real_name,
                 namespace=namespace_name,
                 body=delete_options
             )
-            print(f"StatefulSet '{namespace_name}/{real_name}' 已删除 (cascade=false).")
+            dingo_print(f"StatefulSet '{namespace_name}/{real_name}' deletion initiated.")
 
-            # 2. 创建新的 StatefulSet
+            # 2. 等待 StatefulSet 资源完全删除
+            if not self.wait_for_sts_deletion(apps_v1, real_name, namespace_name, timeout=120):
+                dingo_print(f"warning: wait for StatefulSet '{real_name}' deletion timeout, but still try to continue.")
+
+            # 3. 创建新的 StatefulSet
             created_sts = apps_v1.create_namespaced_stateful_set(
                 namespace=namespace_name,
                 body=modified_sts_data
             )
-            print(f"StatefulSet '{namespace_name}/{real_name}' 已重新创建.")
+            dingo_print(f"StatefulSet '{namespace_name}/{real_name}' already replaced successfully.")
             return created_sts
 
         except Exception as e:
-            print(f"替换 StatefulSet 时发生错误: {e}")
+            dingo_print(f"replace statefulset {namespace_name}/{real_name} failed")
             import traceback
             traceback.print_exc()
             raise e
+
+    def wait_for_sts_deletion(self, apps_v1, sts_name, namespace, timeout=120, interval=1):
+        """
+        等待指定的 StatefulSet 被完全删除。
+
+        参数:
+            apps_v1: apps client。
+            sts_name: StatefulSet 名称。
+            namespace: 命名空间。
+            timeout: 总等待超时时间（秒）。
+            interval: 检查间隔（秒）。
+
+        返回:
+            bool: True 表示删除成功，False 表示超时。
+        """
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                apps_v1.read_namespaced_stateful_set(name=sts_name, namespace=namespace)
+                # 如果read操作没抛异常，说明STS还存在
+                time.sleep(interval)
+            except ApiException as e:
+                if e.status == 404:  # Not Found
+                    dingo_print(f"StatefulSet '{namespace}/{sts_name}' already deleted successfully.")
+                    return True
+                else:
+                    # 其他API错误，可能需要根据情况处理
+                    raise
+            except Exception as e:
+                dingo_print(f"check sts {namespace}/{sts_name} deletion status failed: {e}")
+                time.sleep(interval)
+        dingo_print(f"wait_for_sts_deletion timeout for {namespace}/{sts_name}")
+        return False
 
     def list_pods_by_label_and_node(self, core_v1: client.CoreV1Api,
                                     namespace=None,
@@ -371,7 +628,7 @@ class K8sCommonOperate:
                 if not continue_token:
                     break
         except Exception as e:
-            print(f"list_namespaced_stateful_set failed:{e}")
+            dingo_print(f"list_namespaced_stateful_set failed:{e}")
             raise e
 
         return all_pods
@@ -411,9 +668,63 @@ class K8sCommonOperate:
                 if not continue_token:
                     break
         except Exception as e:
-            print(f"list_namespaced_stateful_set failed:{e}")
+            dingo_print(f"list_namespaced_stateful_set failed:{e}")
             raise e
         return all_sts
+
+    def list_svc_by_label(self, core_v1: client.CoreV1Api, namespace="",
+                          label_selector="", limit=2000, timeout_seconds=60):
+        """
+        根据标签选择器列出Service，支持分页查询所有命名空间或指定命名空间
+
+        :param core_v1: CoreV1Api 客户端实例
+        :param namespace: 命名空间，为空字符串时查询所有命名空间
+        :param label_selector: 标签选择器，例如 "app=my-app,environment=prod"
+        :param limit: 每页返回的结果数量限制
+        :param timeout_seconds: 查询超时时间
+        :return: 匹配的Service列表
+        :raises: RuntimeError 当查询失败时
+        """
+        all_svcs = []
+        continue_token = None
+
+        try:
+            while True:
+                # 构造查询参数
+                kwargs = {
+                    "label_selector": label_selector,
+                    "limit": limit,
+                    "_continue": continue_token,
+                    "timeout_seconds": timeout_seconds
+                }
+
+                try:
+                    if namespace:
+                        # 分页查询指定命名空间
+                        resp = core_v1.list_namespaced_service(
+                            namespace=namespace,
+                            **kwargs
+                        )
+                    else:
+                        # 分页查询所有命名空间
+                        resp = core_v1.list_service_for_all_namespaces(
+                            **kwargs
+                        )
+                except ApiException as ex:
+                    raise RuntimeError(f"Failed to query Services: {str(ex)}") from ex
+
+                all_svcs.extend(resp.items)
+
+                # 检查是否还有更多数据
+                continue_token = resp.metadata._continue
+                if not continue_token:
+                    break
+
+        except Exception as e:
+            dingo_print(f"list_svc_by_label failed: {e}")
+            raise e
+
+        return all_svcs
 
     def delete_sts_by_name(self,
             apps_v1: client.AppsV1Api,
@@ -441,13 +752,13 @@ class K8sCommonOperate:
                 propagation_policy=propagation_policy,
                 body=client.V1DeleteOptions()
             )
-            print(f"已删除 StatefulSet: {real_sts_name}")
+            dingo_print(f"delete StatefulSet: {namespace}/{real_sts_name} succeed")
         except ApiException as e:
             if e.status == 404:
-                print(f"StatefulSet 不存在 (StatefulSet: {real_sts_name})")
+                dingo_print(f"StatefulSet not exist: {namespace}/{real_sts_name})")
                 return
             else:
-                print(f"删除失败: {e.reason}")
+                dingo_print(f"delete {namespace}/{real_sts_name} failed: {e.reason}")
             return False
 
     def delete_service_by_name(self,
@@ -471,17 +782,17 @@ class K8sCommonOperate:
                 grace_period_seconds=grace_period_seconds,
                 body=client.V1DeleteOptions()
             )
-            print(f"已删除 Service: {service_name}")
+            dingo_print(f"delete service: {namespace}/{service_name} succeed")
             return True
 
         except ApiException as e:
             import traceback
             traceback.print_exc()
             if e.status == 404:
-                print(f"Service 不存在: {service_name}")
+                dingo_print(f"service {namespace}/{service_name} not found: {service_name}")
                 return
             else:
-                print(f"删除失败: {e.reason}")
+                dingo_print(f"delete service {namespace}/{service_name} failed: {e}")
             raise e
 
     def delete_namespaced_ingress(self, networking_v1: client.NetworkingV1Api, ingress_name: str, namespace: str):
@@ -495,19 +806,19 @@ class K8sCommonOperate:
         try:
             # 删除Ingress
             api_response = networking_v1.delete_namespaced_ingress(
-                name=f"{ingress_name}-{INGRESS_SUFFIX}",
+                name=f"{ingress_name}-{INGRESS_SIGN}",
                 namespace=namespace,
                 body=client.V1DeleteOptions(  # 可选删除参数
                     propagation_policy='Foreground',  # 删除策略：'Foreground', 'Background', 'Orphan'
                     grace_period_seconds=0  # 宽限期秒数，0表示立即删除
                 )
             )
-            print(f"Ingress '{ingress_name}' in namespace '{namespace}' deleted successfully. API Response status: {api_response.status}")
+            dingo_print(f"Ingress '{ingress_name}' in namespace '{namespace}' deleted successfully. API Response status: {api_response.status}")
         except Exception as e:
-            print(f"Exception when calling NetworkingV1Api->delete_namespaced_ingress {ingress_name}: {e}")
+            dingo_print(f"Exception when calling NetworkingV1Api->delete_namespaced_ingress {ingress_name}: {e}")
             raise e
 
-    def list_node(self, core_v1: client.CoreV1Api, label_selector="kubernetes.io/role"):
+    def list_node(self, core_v1: client.CoreV1Api, label_selector="kubernetes.io/role=node"):
         """
        查询所有node基础信息
 
@@ -520,10 +831,27 @@ class K8sCommonOperate:
             }
             return core_v1.list_node(**kwargs).items
         except ApiException as e:
-            print(f"查询Node失败: {e.reason} (状态码: {e.status})")
+            dingo_print(f"query node failed: {e.reason} (status: {e.status})")
             raise e.reason
 
-    def create_ns_configmap(self, core_v1: client.CoreV1Api, namespace_name: str, configmap_name: str,
+    def read_node(self, core_v1: client.CoreV1Api, node_name: str):
+        """
+        读取指定名称的节点信息
+
+        :param core_v1: CoreV1Api客户端实例
+        :param node_name: 要查询的节点名称
+        :return: Node对象
+        :raises: Exception 当Kubernetes API调用失败时
+        """
+        try:
+            node = core_v1.read_node(name=node_name)
+            return node
+        except ApiException as e:
+            error_msg = f"read node {node_name} fail: {e.reason} (status: {e.status})"
+            dingo_print(error_msg)
+            raise Exception(error_msg) from e
+
+    def create_ns_configmap(self, core_v1: client.CoreV1Api, namespace_name: str, configmap_name: str, ai_instance_db,
                             configmap_data: Dict[str, str]):
         """
         创建 ConfigMap
@@ -531,32 +859,186 @@ class K8sCommonOperate:
         :param namespace_name: 命名空间名称
         :param configmap_name: ConfigMap 名称
         """
-        try:
-            core_v1.read_namespaced_config_map(configmap_name, namespace_name)
-        except ApiException as e:
-            if e.status == 404:
-                # ConfigMap 不存在，创建新的
-                LOG.info(f"ConfigMap '{configmap_name}' not found in namespace '{namespace_name}'. Creating new one.")
+        from dingo_command.services.sshkey import KeyService
+        # 如何把这些key_content数据组合起来
+        query_params = {}
+        query_params['user_id'] = ai_instance_db.instance_user_id
+        query_params['tenant_id'] = ai_instance_db.instance_tenant_id
+        data = KeyService().list_keys(query_params, 1, -1, None, None)
+        key_content_list = []
+        configmap_data = configmap_data
+        if data.get("data"):
+            for key in data.get("data"):
+                key_content_list.append(key.key_content)
+            key_content_list = list(set(key_content_list))
 
-                # 创建新的 ConfigMap 对象
-                new_configmap = client.V1ConfigMap(
-                    api_version="v1",
-                    kind="ConfigMap",
-                    metadata=client.V1ObjectMeta(
-                        name=configmap_name,
-                        namespace=namespace_name
-                    ),
-                    data=configmap_data
-                )
-                try:
-                    # 创建 ConfigMap
-                    core_v1.create_namespaced_config_map(
-                        namespace=namespace_name,
-                        body=new_configmap
-                    )
-                    LOG.info(f"Successfully created new ConfigMap '{configmap_name}' with the SSH public key.")
-                except ApiException as e:
-                    raise e
+        if ai_instance_db.is_manager:
+            if key_content_list:
+                configmap_data = {
+                    "authorized_keys": "\n".join(key_content_list)
+                }
+        else:
+            # 把所有的tenant_id为同一个的key_content都租户起来
+            query_params = {}
+            query_params['tenant_id'] = ai_instance_db.instance_tenant_id
+            query_params['is_manager'] = True
+            data = KeyService().list_keys(query_params, 1, -1, None, None)
+            key_content_tmp_list = []
+            if data.get("data"):
+                for key in data.get("data"):
+                    key_content_tmp_list.append(key.key_content)
+                key_content_total_list = list(set(key_content_tmp_list + key_content_list))
+                configmap_data = {
+                    "authorized_keys": "\n".join(key_content_total_list)
+                }
             else:
-                # 其他 API 错误
-                raise e
+                if key_content_list:
+                    configmap_data = {
+                        "authorized_keys": "\n".join(key_content_list)
+                    }
+
+        max_retries = 3
+        retry_delay = 1
+        for attempt in range(max_retries):
+            try:
+                # 如果有就修改
+                configmap = core_v1.read_namespaced_config_map(configmap_name, namespace_name)
+                if configmap.data.get("authorized_keys", "") != configmap_data["authorized_keys"]:
+                    configmap.data["authorized_keys"] = configmap_data["authorized_keys"]
+                    core_v1.patch_namespaced_config_map(
+                        name=configmap_name,
+                        namespace=namespace_name,
+                        body=configmap
+                    )
+            except ApiException as e:
+                if e.status == 404:
+                    # ConfigMap 不存在，创建新的
+                    dingo_print(f"ConfigMap {configmap_name} not found in namespace {namespace_name}. Creating new one.")
+                    # 创建新的 ConfigMap 对象
+                    new_configmap = client.V1ConfigMap(
+                        api_version="v1",
+                        kind="ConfigMap",
+                        metadata=client.V1ObjectMeta(
+                            name=configmap_name,
+                            namespace=namespace_name
+                        ),
+                        data=configmap_data
+                    )
+                    try:
+                        # 创建 ConfigMap
+                        core_v1.create_namespaced_config_map(
+                            namespace=namespace_name,
+                            body=new_configmap
+                        )
+                        dingo_print(f"Successfully created new ConfigMap {configmap_name} with the SSH public key.")
+                    except ApiException as e:
+                        if e.status == 409:
+                            time.sleep(retry_delay)
+                            continue
+                        else:
+                            raise e
+                elif e.status == 409:
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        raise e
+                else:
+                    # 其他 API 错误
+                    import traceback
+                    traceback.print_exc()
+                    raise e
+
+    def create_docker_registry_secret(self, core_v1: client.CoreV1Api, namespace, secret_name, docker_server, docker_username,
+                                      docker_password, docker_email=None):
+        """
+        创建 Docker Registry 类型的 Secret
+        """
+        # 构造认证字符串并编码
+        auth_str = f"{docker_username}:{docker_password}"
+        auth_b64 = base64.b64encode(auth_str.encode()).decode()
+
+        # 构造 Docker Config JSON 对象并编码
+        docker_config_json = {
+            "auths": {
+                docker_server: {
+                    "username": docker_username,
+                    "password": docker_password,
+                    "auth": auth_b64
+                }
+            }
+        }
+        docker_config_json_b64 = base64.b64encode(str(docker_config_json).replace("'", '"').encode()).decode()
+
+        # 定义 Secret 对象
+        secret = client.V1Secret(
+            metadata=client.V1ObjectMeta(name=secret_name, namespace=namespace),
+            type="kubernetes.io/dockerconfigjson",
+            data={".dockerconfigjson": docker_config_json_b64}
+        )
+
+        try:
+            # 在指定命名空间中创建 Secret
+            core_v1.create_namespaced_secret(namespace=namespace, body=secret)
+            dingo_print(f"Secret '{secret_name}' created successfully in namespace '{namespace}'.")
+        except ApiException as e:
+            if e.status == 409:  # 如果 Secret 已存在，则更新它
+                dingo_print(f"Secret '{secret_name}' already exists in namespace '{namespace}'. Updating it.")
+                core_v1.replace_namespaced_secret(name=secret_name, namespace=namespace, body=secret)
+                dingo_print(f"Secret '{secret_name}' updated successfully in namespace '{namespace}'.")
+            else:
+                dingo_print(f"Failed to create/update secret '{secret_name}': {e}")
+                raise
+
+    def patch_default_service_account(self, core_v1: client.CoreV1Api, namespace, secret_name):
+        """
+        为指定命名空间的默认 ServiceAccount 添加 imagePullSecrets
+        """
+        try:
+            # 获取当前的默认 ServiceAccount
+            sa = core_v1.read_namespaced_service_account(name="default", namespace=namespace)
+            # 确保 image_pull_secrets 属性是一个列表
+            if sa.image_pull_secrets is None:
+                sa.image_pull_secrets = []
+
+            # 检查要添加的 secret 是否已存在，避免重复添加
+            existing_secrets = [ips.name for ips in sa.image_pull_secrets]
+            if secret_name not in existing_secrets:
+                # 添加新的 imagePullSecret
+                sa.image_pull_secrets.append(client.V1LocalObjectReference(name=secret_name))
+                # 更新 ServiceAccount
+                core_v1.replace_namespaced_service_account(name="default", namespace=namespace, body=sa)
+                dingo_print(
+                    f"Successfully added secret '{secret_name}' to default ServiceAccount in namespace '{namespace}'.")
+            else:
+                dingo_print(
+                    f"Secret '{secret_name}' already exists in imagePullSecrets of default ServiceAccount in namespace '{namespace}'.")
+        except ApiException as e:
+            dingo_print(f"Failed to patch default ServiceAccount in namespace '{namespace}': {e}")
+            if e.status == 404:
+                dingo_print(f"Default ServiceAccount in namespace '{namespace}' not ready yet")
+                # 构造 image_pull_secrets
+                image_pull_secrets = [client.V1LocalObjectReference(name=secret_name)]
+
+                # 构造 ServiceAccount 对象
+                body = client.V1ServiceAccount(
+                    metadata=client.V1ObjectMeta(name=secret_name),
+                    image_pull_secrets=image_pull_secrets
+                )
+
+                try:
+                    # 创建 ServiceAccount
+                    api_response = core_v1.create_namespaced_service_account(
+                        namespace=namespace,
+                        body=body
+                    )
+                    dingo_print(f"ServiceAccount {secret_name} created successfully in namespace '{namespace}'.")
+                    return api_response
+                except ApiException as e:
+                    dingo_print(f"create ServiceAccount {secret_name} in namespace '{namespace}' failed: {e}")
+                    if e.status == 409:
+                        dingo_print(f"Default ServiceAccount in namespace '{namespace}' ready yet")
+                    raise
+            else:
+                dingo_print(f"Failed to patch default ServiceAccount in namespace '{namespace}': {e}")
+                raise

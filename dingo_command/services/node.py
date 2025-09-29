@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import uuid
+import ctypes
 from io import BytesIO
 
 import pandas as pd
@@ -19,7 +20,7 @@ from dingo_command.db.models.node.sql import NodeSQL
 from dingo_command.db.models.instance.sql import InstanceSQL
 from math import ceil
 from oslo_log import log
-from dingo_command.api.model.cluster import ClusterTFVarsObject, NodeGroup, ClusterObject, ScaleNodeObject, PortForwards
+from dingo_command.api.model.cluster import ClusterTFVarsObject, NodeGroup, ClusterObject, ScaleNodeObject, PortForwards,KubeClusterObject
 from dingo_command.db.models.cluster.models import Cluster as ClusterDB
 from dingo_command.db.models.node.models import NodeInfo as NodeDB
 from dingo_command.db.models.instance.models import Instance as InstanceDB
@@ -28,7 +29,8 @@ from dingo_command.db.engines.mysql import get_engine, get_session
 
 from dingo_command.services.custom_exception import Fail
 from dingo_command.services.system import SystemService
-from dingo_command.common.nova_client import NovaClient
+
+from dingo_command.common.nova_client import nova_client
 from dingo_command.services import CONF
 
 LOG = log.getLogger(__name__)
@@ -42,6 +44,33 @@ thin_border = Border(
     top=Side(border_style="thin", color="000000"),  # 上边框
     bottom=Side(border_style="thin", color="000000")  # 下边框
 )
+def set_netns(netns_name):
+    """
+    将当前线程切换到指定的网络命名空间。
+    libc.setns() 系统调用需要文件描述符和命名空间标识。
+    """
+    libc = ctypes.CDLL("libc.so.6")
+    netns_path = f"/run/netns/{netns_name}"
+    if not os.path.exists(netns_path):
+        #raise FileNotFoundError(f"网络命名空间 {netns_name} 不存在于 {netns_path}")
+        print(f"网络命名空间 {netns_name} 不存在于 {netns_path}")
+        return
+    current_ns_fd = os.open("/proc/self/ns/net", os.O_RDONLY)
+    fd = os.open(netns_path, os.O_RDONLY)
+    try:
+        if libc.setns(fd, 0) == -1:
+            raise OSError("setns 系统调用失败")
+        print(f"已切换到网络命名空间: {netns_name}")
+        # 返回一个恢复函数
+        def restore_ns():
+            if libc.setns(current_ns_fd, 0) == -1:
+                raise OSError("恢复原始网络命名空间失败")
+            print("已恢复到原始网络命名空间")
+            os.close(current_ns_fd)
+        
+        return restore_ns
+    finally:
+        os.close(fd)
 
 system_service = SystemService()
 
@@ -54,8 +83,9 @@ class NodeService:
 
     # 查询资产列表
     @classmethod
-    def list_nodes(cls, query_params, page, page_size, sort_keys, sort_dirs):
+    def list_nodes(cls, query_params, page, page_size, sort_keys, sort_dirs, detail: bool = False):
         # 业务逻辑
+        restore_ns = None
         try:
             # 按照条件从数据库中查询数据
             count, data = NodeSQL.list_nodes(query_params, page, page_size, sort_keys, sort_dirs)
@@ -68,11 +98,55 @@ class NodeService:
                 res['totalPages'] = ceil(count / int(page_size))
             res['total'] = count
             res['data'] = data
+            if detail:
+                #调用common中的k8s_client查询node资源列表，并将node资源信息添加到data中的每个节点信息中
+                
+                    from dingo_command.common.k8s_client import K8sClient  # 假设k8s_client是K8sClient类
+                    
+                    if data == None or len(data) == 0:
+                        return res
+                    cluster_id = data[0].cluster_id  # 假设data中的节点有cluster_id
+                    #查询cluster_id对应的集群信息
+                    query_params = {}
+                    query_params["id"] = cluster_id
+                    result = ClusterSQL.list_cluster(query_params, 1, 10, None, None)
+                    if not result or not result[1]:
+                        return res
+                    cluster = result[1][0]
+                    admin_network_id = cluster.admin_network_id
+                    restore_ns = set_netns("qdhcp-" + str(admin_network_id))
+                    # get kube_config from kube_info
+                    kube_info = KubeClusterObject(**json.loads(cluster.kube_info))
+                    k8s_client = K8sClient(kubeconfig_content=str(kube_info.kube_config))  # 初始化客户端，可能需要传递集群配置
+                    k8s_nodes = k8s_client.list_resource("nodes")  # 查询K8s node列表
+                    # k8s_nodes 可能是 list_resource("nodes") 的原始返回值
+                    # 需要将其转换为以节点名为 key 的 dict，方便后续匹配
+                    k8s_node_map = {}
+                    if isinstance(k8s_nodes, dict) and "items" in k8s_nodes:
+                        for item in k8s_nodes["items"]:
+                            name = item.get("metadata", {}).get("name")
+                            if name:
+                                k8s_node_map[name] = item
+                    elif isinstance(k8s_nodes, list):
+                        for item in k8s_nodes:
+                            name = item.get("metadata", {}).get("name")
+                            if name:
+                                k8s_node_map[name] = item
+                    else:
+                        return res 
+
+                    for node in data:
+                        node_name = node.name
+                        setattr(node, 'k8s_info', k8s_node_map.get(node_name, {}))
+
             return res
         except Exception as e:
             import traceback
             traceback.print_exc()
             return None
+        finally:
+            if restore_ns:
+                restore_ns()
 
     def get_node(self, node_id):
         if not node_id:
@@ -169,11 +243,10 @@ class NodeService:
         node_db_list, instance_db_list = [], []
         extra_dict = json.loads(cluster_info.extra)
         node_index = int(extra_dict.get("node_count", 0)) + 1
-        nova_client = NovaClient()
         for idx, node in enumerate(cluster.node_config):
             if node.role == "worker" and node.type == "vm":
-                cpu, gpu, mem, disk = self.get_flavor_info(nova_client, node.flavor_id)
-                operation_system = self.get_image_info(nova_client, node.image)
+                cpu, gpu, mem, disk = nova_client.get_flavor_info(node.flavor_id)
+                operation_system = nova_client.get_image_info(node.image)
                 for i in range(node.count):
                     forward_rules_new = []
                     if forward_rules:
@@ -192,7 +265,8 @@ class NodeService:
                         port_forwards=[PortForwards(**forward) for forward in forward_rules_new],
                         use_local_disk=node.use_local_disk,
                         volume_size=node.volume_size,
-                        volume_type=node.volume_type
+                        volume_type=node.volume_type,
+                        data_volumes=node.data_volumes if hasattr(node, 'data_volumes') and node.data_volumes else []
                     )
                     scale_nodes.append(f"{cluster_info.name}-node-{int(node_index)}")
                     instance_db = InstanceDB()
@@ -255,8 +329,8 @@ class NodeService:
                     node_db_list.append(node_db)
                     node_index = node_index + 1
             if node.role == "worker" and node.type == "baremetal":
-                cpu, gpu, mem, disk = self.get_flavor_info(nova_client, node.flavor_id)
-                operation_system = self.get_image_info(nova_client, node.image)
+                cpu, gpu, mem, disk = nova_client.get_flavor_info(node.flavor_id)
+                operation_system = nova_client.get_image_info(node.image)
                 for i in range(node.count):
                     forward_rules_new = []
                     if forward_rules:
@@ -272,7 +346,8 @@ class NodeService:
                         floating_ip=False,
                         etcd=False,
                         image_id=node.image,
-                        port_forwards=[PortForwards(**forward) for forward in forward_rules_new]
+                        port_forwards=[PortForwards(**forward) for forward in forward_rules_new],
+                        use_local_disk = True
                     )
                     scale_nodes.append(f"{cluster_info.name}-node-{int(node_index)}")
                     instance_db = InstanceDB()
@@ -454,6 +529,10 @@ class NodeService:
             image_uuid = content.get("image_uuid")
             ssh_user = content.get("ssh_user")
             password = content.get("password")
+            k8s_masters = content.get("masters") if content.get("masters") is not None else {}
+            admin_network_id = content.get("admin_network_id")
+            admin_subnet_id = content.get("admin_subnet_id")
+            use_existing_network = content.get("use_existing_network")
             forward_float_ip_id = content.get("forward_float_ip_id")
             lb_enbale = content.get("k8s_master_loadbalancer_enabled")
             number_of_k8s_masters = content.get("number_of_k8s_masters")
@@ -476,13 +555,14 @@ class NodeService:
                 cluster_name=cluster_info.name,
                 image_uuid=image_uuid,
                 nodes=k8s_nodes,
+                masters=k8s_masters,  # 添加现有 master 节点，防止被删除
                 subnet_cidr=subnet_cidr,
                 floatingip_pool=floatingip_pool,
                 public_floatingip_pool=public_floatingip_pool,
                 public_subnetids=public_subnetids,
                 external_subnetids=external_subnetids,
                 external_net=external_net_id,
-                use_existing_network=False,
+                use_existing_network=use_existing_network,
                 ssh_user=ssh_user,
                 k8s_master_loadbalancer_enabled=lb_enbale,
                 number_of_k8s_masters= number_of_k8s_masters,
@@ -492,6 +572,8 @@ class NodeService:
                 tenant_id=cluster_info.project_id,
                 forward_float_ip_id=forward_float_ip_id,
                 image_master=image_master,
+                admin_network_id=admin_network_id,
+                admin_subnet_id=admin_subnet_id
             )
             if cluster.node_config[0].auth_type == "password":
                 tfvars.password = cluster.node_config[0].password
@@ -745,33 +827,7 @@ class NodeService:
         instance_list_json = json.dumps(instance_list_dict)
         return instance_list, instance_list_json
 
-    def get_flavor_info(self, nova_client, flavor_id):
-        flavor = nova_client.nova_get_flavor(flavor_id)
-        cpu = 0
-        gpu = 0
-        mem = 0
-        disk = 0
-        if flavor is not None:
-            cpu = flavor['vcpus']
-            mem = flavor['ram']
-            disk = flavor['disk']
-            if "extra_specs" in flavor and "pci_passthrough:alias" in flavor["extra_specs"]:
-                pci_alias = flavor['extra_specs']['pci_passthrough:alias']
-                if ':' in pci_alias:
-                    gpu = pci_alias.split(':')[1]
-        return int(cpu), int(gpu), int(mem), int(disk)
 
-    def get_image_info(self, nova_client, image_id):
-        operation_system = ""
-        image = nova_client.glance_get_image(image_id)
-        if image is not None:
-            if image.get("os_version"):
-                operation_system = image.get("os_version")
-            elif image.get("os_distro"):
-                operation_system = image.get("os_distro")
-            else:
-                operation_system = image.get("name")
-        return operation_system
 
     def get_dict_node_instance_info(self, node_err_list):
         node_info_list = []

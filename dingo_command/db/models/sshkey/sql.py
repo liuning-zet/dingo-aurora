@@ -23,12 +23,16 @@ class KeySQL:
                 query = query.filter(KeyInfo.id == query_params["id"])
             if "name" in query_params and query_params["name"]:
                 query = query.filter(KeyInfo.name.like(f"%{query_params['name']}%"))
+            if "full_name" in query_params and query_params["full_name"]:
+                query = query.filter(KeyInfo.name == query_params["full_name"])
             if "status" in query_params and query_params["status"]:
                 query = query.filter(KeyInfo.status == query_params["status"])
             if "tenant_id" in query_params and query_params["tenant_id"]:
                 query = query.filter(KeyInfo.tenant_id == query_params["tenant_id"])
             if "user_id" in query_params and query_params["user_id"]:
                 query = query.filter(KeyInfo.user_id == query_params["user_id"])
+            if "is_manager" in query_params and query_params["is_manager"]:
+                query = query.filter(KeyInfo.is_manager == query_params["is_manager"])
             if "user_name" in query_params and query_params["user_name"]:
                 query = query.filter(KeyInfo.user_name.like(f"%{query_params['user_name']}%"))
             # 总数

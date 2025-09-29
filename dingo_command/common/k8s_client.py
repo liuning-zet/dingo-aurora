@@ -1,15 +1,18 @@
+import os
 from kubernetes import client, config, dynamic
 from kubernetes.client.rest import ApiException
 from typing import List, Dict, Any, Optional, Union
-
+import logging
 from dingo_command.common.k8s.resource import ResourceClientFactory
+
+logger = logging.getLogger(__name__)
 
 class K8sClient:
     """
     一个统一的 Kubernetes API 客户端，支持查询、创建内置资源和自定义资源。
     内部主要使用 dynamic_client 实现通用操作。
-    """
-    def __init__(self, kubeconfig_path: Optional[str] = None, kubeconfig_content: Optional[str] = None):
+    """ 
+    def __init__(self, kubeconfig_path: Optional[str] = None, kubeconfig_content: Optional[str] = None, netns: Optional[str] = None):
         """
         初始化 Kubernetes 客户端。
 
@@ -19,15 +22,13 @@ class K8sClient:
                                              1. 默认 kubeconfig 文件路径 (~/.kube/config)
                                              2. 集群内配置 (In-cluster config)
         """
-        self._load_kubernetes_config(kubeconfig_path,kubeconfig_content)
-        # 初始化 dynamic_client，它是创建/更新/删除资源的关键
+        self._load_kubernetes_config(kubeconfig_path, kubeconfig_content, netns)
         self._dynamic_client = dynamic.DynamicClient(client.ApiClient())
-        # 对于查询，为了兼容性或特定优化，保留特定客户端
         self._core_v1_api = client.CoreV1Api()
         self._apps_v1_api = client.AppsV1Api()
         print("Kubernetes 客户端初始化成功。")
 
-    def _load_kubernetes_config(self, kubeconfig_path: Optional[str], kubeconfig_content: Optional[str] = None):
+    def _load_kubernetes_config(self, kubeconfig_path: Optional[str], kubeconfig_content: Optional[str] = None, netns: Optional[str] = None):
         """内部方法：加载 Kubernetes 配置。"""
         try:
             if kubeconfig_path:
@@ -68,6 +69,7 @@ class K8sClient:
             print(f"获取 Kubernetes 版本信息失败: {e}")
             # 默认假设为较新版本
             return "1.25"
+
     def _infer_kind_from_resource_type(self, resource_type: str) -> str:
         """
         根据资源类型（复数形式）推断对应的 Kind（单数形式）。
@@ -319,7 +321,15 @@ class K8sClient:
                 keys = path.split('.')
                 value = obj
                 for key in keys:
-                    if isinstance(value, dict):
+                    if key == "create_time":
+                        key = "creationTimestamp"
+                    if key in ("status", "creationTimestamp", "labels", "name"):
+                        if isinstance(value, dict):
+                            if key == "status":
+                                value = value.get("status").get("phase")
+                                continue
+                            value = value.get("metadata").get(key)
+                    elif isinstance(value, dict):
                         value = value.get(key)
                     else:
                         return None
@@ -330,7 +340,6 @@ class K8sClient:
         def sort_key(item: Dict[str, Any]):
             """排序键函数"""
             value = get_nested_value(item, sort_by)
-            
             # 处理不同类型的值
             if value is None:
                 return ""
@@ -345,7 +354,7 @@ class K8sClient:
                 return str(value).lower()
 
         try:
-            reverse = sort_order.lower() == 'desc'
+            reverse = sort_order.lower() == 'descend'
             return sorted(items, key=sort_key, reverse=reverse)
         except Exception as e:
             print(f"排序时发生错误: {e}")
@@ -561,15 +570,17 @@ class K8sClient:
                 filtered_items.append(item)
         
         return filtered_items
-    def _paginate_items(self, items: List[Dict[str, Any]], page: int, page_size: int) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+
+    def _paginate_items(self, items: List[Dict[str, Any]], page: int, page_size: int) \
+            -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
         对资源列表进行分页处理。
-        
+
         Args:
             items: 资源列表
             page: 页码，从1开始
-            page_size: 每页大小
-            
+            page_size: 每页大小。如果为-1，则返回所有项目
+
         Returns:
             tuple: (分页后的资源列表, 分页元数据)
         """
@@ -578,25 +589,44 @@ class K8sClient:
         page_size = int(page_size)
 
         total_count = len(items)
-        total_pages = (total_count + page_size - 1) // page_size if page_size > 0 else 1
-        
-        # 确保页码有效
-        if page < 1:
+
+        # 处理 page_size = -1 的情况，返回所有项目
+        if page_size == -1:
+            # 当 page_size 为 -1 时，将所有项目视为一页
+            effective_page_size = total_count
+            total_pages = 1 if total_count > 0 else 0
+            # 强制设置 page=1，因为所有数据都在一页
             page = 1
-        elif page > total_pages and total_pages > 0:
+        else:
+            # 正常分页计算
+            if page_size <= 0:
+                # 除了 -1 外，page_size 不应小于等于 0，这里可以抛出异常或设置为默认值
+                # 这里选择设置为默认值 10，你也可以根据需求抛出 ValueError
+                page_size = 10
+
+            effective_page_size = page_size
+            total_pages = (total_count + effective_page_size - 1) // effective_page_size \
+                if effective_page_size > 0 else 1
+
+        # 确保页码有效
+        if total_pages == 0:
+            page = 0
+        elif page < 1:
+            page = 1
+        elif page > total_pages:
             page = total_pages
-        
+
         # 计算起始和结束索引
-        start_index = (page - 1) * page_size
-        end_index = start_index + page_size
-        
+        start_index = (page - 1) * effective_page_size
+        end_index = start_index + effective_page_size
+
         # 获取当前页的数据
         paginated_items = items[start_index:end_index]
-        
+
         # 构建分页元数据
         pagination_metadata = {
             'current_page': page,
-            'page_size': page_size,
+            'page_size': effective_page_size,
             'total_count': total_count,
             'total_pages': total_pages,
             'has_previous': page > 1,
@@ -606,8 +636,9 @@ class K8sClient:
             'start_index': start_index + 1 if paginated_items else 0,
             'end_index': start_index + len(paginated_items)
         }
-        
+
         return paginated_items, pagination_metadata
+
     def _convert_k8s_object_to_dict(self, obj: Any) -> Dict[str, Any]:
         """
         将 K8s 对象安全地转换为字典格式，确保包含 apiVersion 和 kind。
@@ -640,6 +671,7 @@ class K8sClient:
         if 'kind' not in result or not result.get('kind'):
             result['kind'] = obj.get('kind', 'Pod')  # 默认值为 Pod
         return result
+
     def list_resource(
             self,
             resource_type: str,
@@ -656,51 +688,52 @@ class K8sClient:
             search_terms: Optional[List[str]] = None,
         ) -> Dict[str, Any]:
         #根据资源类型组织不同的filter
+        
         try:
             if not api_version:
                 api_version = self._infer_api_version(resource_type)
 
-            resource_client = self._dynamic_client.resources.get(api_version=api_version, kind=self._infer_kind_from_resource_type(resource_type))
+                resource_client = self._dynamic_client.resources.get(api_version=api_version, kind=self._infer_kind_from_resource_type(resource_type))
 
-            # 构建查询参数
-            params = {
-                'label_selector': label_selector,
-                'field_selector': field_selector,
-                'limit': limit,
-                '_continue': continue_token
-            }
+                # 构建查询参数
+                params = {
+                    'label_selector': label_selector,
+                    'field_selector': field_selector,
+                    'limit': limit,
+                    '_continue': continue_token
+                }
 
-            # 执行查询
-            if namespace:
-                resource_list = resource_client.get(namespace=namespace, **self._filter_none_params(params))
-            else:
-                resource_list = resource_client.get(**self._filter_none_params(params))
+                # 执行查询
+                if namespace:
+                    resource_list = resource_client.get(namespace=namespace, **self._filter_none_params(params))
+                else:
+                    resource_list = resource_client.get(**self._filter_none_params(params))
 
             # 获取资源列表
             items = resource_list.items if hasattr(resource_list, 'items') else []
-            
+
             # 转换为字典格式
             items_dict = []
             for item in items:
-               items_dict.append(self._convert_k8s_object_to_dict(item))
-               
+                items_dict.append(self._convert_k8s_object_to_dict(item))
             # 创建资源工厂
             factory = ResourceClientFactory(self)
             items_dict = factory.list(items_dict, resource_type = resource_type, namespace=namespace, label_selector=label_selector, field_selector=field_selector, filters=search_terms)
-        #    # 应用多个自定义过滤器
-        #     if search_terms:
-        #         for term in search_terms:
-        #             # 这里假设 term 是一个简单的字符串，可以是字段名或值
-        #             if '=' in term:
-        #                 key, value = term.split('=', 1)
-        #                 items_dict = self._filter_by_key_value(items, key.strip(), value.strip())
-        #             else:
-        #                 # 如果没有 '=', 则默认按 name 过滤
-        #                 items_dict = self._filter_by_key_value(items, 'name', term.strip())
-                    
+           # 应用多个自定义过滤器
+            if search_terms:
+                tmp_items_dict = []
+                for term in search_terms:
+                    if '=' in term:
+                        key, value = term.split('=', 1)
+
+
                         
-                #result['total_count'] = len(result['items'])
-            
+                        if key == "name":
+                            for item in items_dict:
+                                if value.lower() in item.get('metadata', {}).get('name', '').lower():
+                                    tmp_items_dict.append(item)
+                            items_dict = tmp_items_dict
+
             # 应用排序
             if sort_by:
                 items_dict = self._sort_resources(items_dict, sort_by, sort_order)
@@ -743,10 +776,8 @@ class K8sClient:
             return {
                 'items': [],
                 'metadata': {'error': str(e)},
-                'total_count': 0
-            }
-
-
+                    'total_count': 0
+                }
 
     def create_resource(
         self,
@@ -956,6 +987,10 @@ class K8sClient:
             delete_options = {}
             if propagation_policy:
                 delete_options['propagation_policy'] = propagation_policy
+            else:
+                # 默认使用 Background 策略
+                delete_options['propagation_policy'] = 'Background'
+    
             if dry_run:
                 delete_options['dry_run'] = ['All']
 
@@ -1065,6 +1100,7 @@ class K8sClient:
             propagation_policy=propagation_policy,
             dry_run=dry_run
         )
+
     def update_resource(
         self,
         resource_body: Dict[str, Any],

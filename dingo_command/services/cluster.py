@@ -6,6 +6,7 @@ import json
 import os
 import random
 import uuid
+import ctypes
 from datetime import datetime
 
 from openpyxl.styles import Border, Side
@@ -26,11 +27,12 @@ from dingo_command.db.models.cluster.models import Cluster as ClusterDB
 from dingo_command.db.models.node.models import NodeInfo as NodeDB
 from dingo_command.db.models.instance.models import Instance as InstanceDB
 from dingo_command.common import neutron
-from dingo_command.common.nova_client import NovaClient
+from dingo_command.common.nova_client import nova_client
 from dingo_command.services.custom_exception import Fail
 from dingo_command.services.system import SystemService
 from dingo_command.services import CONF
 from dingo_command.db.engines.mysql import get_session
+from contextlib import contextmanager
 
 
 LOG = log.getLogger(__name__)
@@ -66,16 +68,14 @@ class ClusterService:
         node_index = 1
         master_index = 1
         cluster_new = copy.deepcopy(cluster)
-
-        # 只有 kubernetes 类型才需要获取 master 相关的配置信息
-        if cluster.type == "kubernetes":
-            (master_cpu, master_gpu, master_mem, master_disk,
-             master_flavor_id) = self.get_master_flavor_info(master_flvaor)
-            master_operation_system, master_image_id = self.get_master_image_info(master_image)
-
+        # (master_cpu, master_gpu, master_mem, master_disk,
+        #  master_flavor_id) = self.get_master_flavor_info(master_flvaor)
+        # master_operation_system, master_image_id = self.get_master_image_info(master_image)
         worker_node = []
         for idx, node in enumerate(cluster.node_config):
             if node.role == "master" and node.type == "vm":
+                cpu, gpu, mem, disk = nova_client.get_flavor_info(node.flavor_id)
+                operation_system = nova_client.get_image_info(node.image)
                 for i in range(node.count):
                     k8s_masters[f"master-{int(master_index)}"] = NodeGroup(
                         az=self.get_az_value(node.type),
@@ -96,8 +96,8 @@ class ClusterService:
                     instance_db.user = node.user
                     instance_db.password = node.password
                     instance_db.security_group = cluster.name
-                    instance_db.flavor_id = master_flavor_id
-                    instance_db.image_id = master_image_id
+                    instance_db.flavor_id = node.flavor_id
+                    instance_db.image_id = node.image
                     instance_db.status = "creating"
                     instance_db.status_msg = ""
                     instance_db.floating_forward_ip = ""
@@ -105,13 +105,13 @@ class ClusterService:
                     instance_db.project_id = ""
                     instance_db.server_id = ""
                     instance_db.openstack_id = ""
-                    instance_db.operation_system = master_operation_system
-                    instance_db.cpu = master_cpu
-                    instance_db.gpu = master_gpu
-                    instance_db.mem = master_mem
-                    instance_db.disk = master_disk
+                    instance_db.operation_system = operation_system
+                    instance_db.cpu = cpu
+                    instance_db.gpu = gpu
+                    instance_db.mem = mem
+                    instance_db.disk = disk
                     instance_db.ip_address = ""
-                    instance_db.name = cluster.name + f"-k8s-master-{int(master_index)}"
+                    instance_db.name = cluster.name + f"-master-{int(master_index)}"
                     instance_db.create_time = datetime.now()
                     instance_db_list.append(instance_db)
 
@@ -124,30 +124,31 @@ class ClusterService:
                     node_db.role = node.role
                     node_db.user = node.user
                     node_db.password = node.password
-                    node_db.image = master_image_id
+                    node_db.image = node.image
                     node_db.instance_id = instance_db.id
                     node_db.project_id = cluster.project_id
                     node_db.auth_type = node.auth_type
                     node_db.security_group = cluster.name
-                    node_db.flavor_id = master_flavor_id
-                    node_db.operation_system = master_operation_system
-                    node_db.cpu = master_cpu
-                    node_db.gpu = master_gpu
-                    node_db.mem = master_mem
-                    node_db.disk = master_disk
+                    node_db.flavor_id = node.flavor_id
+                    node_db.operation_system = operation_system
+                    node_db.cpu = cpu
+                    node_db.gpu = gpu
+                    node_db.mem = mem
+                    node_db.disk = disk
                     node_db.status = "creating"
                     node_db.floating_forward_ip = ""
                     node_db.ip_forward_rule = []
                     node_db.status_msg = ""
                     node_db.admin_address = ""
-                    node_db.name = cluster.name + f"-k8s-master-{int(master_index)}"
+                    node_db.name = cluster.name + f"-master-{int(master_index)}"
                     node_db.bus_address = ""
                     node_db.create_time = datetime.now()
                     node_db_list.append(node_db)
                     master_index=master_index+1
+                    worker_node.append(node)
             if node.role == "worker" and node.type == "vm":
-                cpu, gpu, mem, disk = self.get_flavor_info(node.flavor_id)
-                operation_system = self.get_image_info(node.image)
+                cpu, gpu, mem, disk = nova_client.get_flavor_info(node.flavor_id)
+                operation_system = nova_client.get_image_info(node.image)
                 for i in range(node.count):
                     # 设置端口转发的外部端口
                     if cluster.port_forwards is not None:
@@ -165,7 +166,8 @@ class ClusterService:
                         port_forwards=cluster_new.port_forwards,
                         use_local_disk = node.use_local_disk,
                         volume_size=node.volume_size,
-                        volume_type=node.volume_type
+                        volume_type=node.volume_type,
+                        data_volumes=node.data_volumes if hasattr(node, 'data_volumes') and node.data_volumes else []
                     )
                     instance_db = InstanceDB()
                     instance_db.id = str(uuid.uuid4())
@@ -229,8 +231,8 @@ class ClusterService:
                     node_index=node_index+1
                     worker_node.append(node)
             if node.role == "worker" and node.type == "baremetal":
-                cpu, gpu, mem, disk = self.get_flavor_info(node.flavor_id)
-                operation_system = self.get_image_info(node.image)
+                cpu, gpu, mem, disk = nova_client.get_flavor_info(node.flavor_id)
+                operation_system = nova_client.get_image_info(node.image)
                 for i in range(node.count):
                     # 设置端口转发的外部端口
                     if cluster.port_forwards is not None:
@@ -245,7 +247,8 @@ class ClusterService:
                         floating_ip=False,
                         etcd=False,
                         image_id=node.image,
-                        port_forwards=cluster_new.port_forwards
+                        port_forwards=cluster_new.port_forwards,
+                        use_local_disk = True,
                     )
                     instance_db = InstanceDB()
                     instance_db.id = str(uuid.uuid4())
@@ -439,6 +442,7 @@ class ClusterService:
             res_cluster.network_config.kube_lb_address = kube_info.kube_lb_address
             if cluster.admin_network_id and cluster.admin_network_id != "":
                 res_cluster.network_config.admin_network_name = cluster.admin_network_name
+                res_cluster.network_config.admin_network_id = cluster.admin_network_id
             if cluster.admin_subnet_id and cluster.admin_subnet_id!= "":
                 res_cluster.network_config.admin_cidr = cluster.admin_network_cidr
             if cluster.bus_network_id and cluster.bus_network_id != "":
@@ -472,7 +476,30 @@ class ClusterService:
             traceback.print_exc()
             raise e
 
-    def check_cluster_param(self, cluster: ClusterObject):
+    def _check_cidr_overlap(self, cidr1: str, cidr2: str) -> bool:
+        """
+        检查两个CIDR网段是否有重叠
+
+        Args:
+            cidr1: 第一个CIDR网段
+            cidr2: 第二个CIDR网段
+
+        Returns:
+            bool: True表示有重叠，False表示无重叠
+        """
+        import ipaddress
+
+        try:
+            net1 = ipaddress.ip_network(cidr1, strict=False)
+            net2 = ipaddress.ip_network(cidr2, strict=False)
+
+            # 检查是否有重叠
+            return net1.overlaps(net2)
+        except ValueError:
+            # 如果CIDR格式不正确，返回True表示有错误
+            return True
+
+    def check_cluster_param(self, cluster: ClusterObject, neutron_api=None):
         # 判断名称是否重复、判断是否有空值、判断是否有重复的节点配置
         query_params = {}
         query_params["exact_name"] = cluster.name
@@ -488,8 +515,8 @@ class ClusterService:
         if not cluster.node_config:
             raise Fail(error_code=405, error_message="Cluster node_config parameter cannot be empty")
         else:
-            if len(cluster.node_config) == 1 and cluster.type == "kubernetes":
-                raise Fail(error_code=405, error_message="The number of nodes in the cluster cannot be less than 1.")
+            # if len(cluster.node_config) == 1 and cluster.type == "kubernetes":
+            #     raise Fail(error_code=405, error_message="The number of nodes in the cluster cannot be less than 1.")
             for node_info in cluster.node_config:
                 if node_info.role == "master":
                     continue
@@ -505,6 +532,46 @@ class ClusterService:
                 if not port_info.protocol:
                     raise Fail(error_code=405, error_message="The protocol for node port forwarding rules "
                                                              "must be tcp or udp")
+
+        # 检查 CIDR 网段是否重叠
+        cidr_list = []
+        cidr_names = []
+
+        # 获取 pod_cidr 和 service_cidr
+        if cluster.kube_info:
+            if cluster.kube_info.pod_cidr:
+                cidr_list.append(cluster.kube_info.pod_cidr)
+                cidr_names.append("Pod CIDR")
+
+            if cluster.kube_info.service_cidr:
+                cidr_list.append(cluster.kube_info.service_cidr)
+                cidr_names.append("Service CIDR")
+
+        # 如果指定了 admin_subnet_id，获取子网CIDR
+        if cluster.network_config and cluster.network_config.admin_subnet_id:
+            try:
+                # 如果没有传入 neutron_api，则创建新的实例
+                if neutron_api is None:
+                    neutron_api = neutron.API()
+
+                subnet_info = neutron_api.get_subnet_by_id(cluster.network_config.admin_subnet_id)
+
+                if subnet_info and 'cidr' in subnet_info:
+                    admin_cidr = subnet_info['cidr']
+                    cidr_list.append(admin_cidr)
+                    cidr_names.append("Admin Subnet CIDR")
+                else:
+                    raise Fail(error_code=405, error_message=f"无法获取子网 {cluster.network_config.admin_subnet_id} 的CIDR信息")
+            except Exception as e:
+                raise Fail(error_code=405, error_message=f"获取管理子网信息失败: {str(e)}")
+
+        # 检查所有CIDR之间是否有重叠
+        for i in range(len(cidr_list)):
+            for j in range(i + 1, len(cidr_list)):
+                if self._check_cidr_overlap(cidr_list[i], cidr_list[j]):
+                    raise Fail(error_code=405, error_message=f"{cidr_names[i]} 和 {cidr_names[j]} 不能重叠. "
+                                                             f"{cidr_names[i]}: {cidr_list[i]}, {cidr_names[j]}: {cidr_list[j]}")
+
         return True
     
     def generate_random_cidr(self):
@@ -535,9 +602,9 @@ class ClusterService:
     def create_cluster(self, cluster: ClusterObject, token):
         # 验证token
         # 数据校验 todo
-        self.check_cluster_param(cluster)
         try:
             neutron_api = neutron.API()  # 创建API类的实例
+            self.check_cluster_param(cluster, neutron_api)
             external_net = neutron_api.list_external_networks()
 
             lb_enbale = False
@@ -603,6 +670,12 @@ class ClusterService:
                 tfvars.password = ""
             else:
                 tfvars.password = ""
+
+            if use_existing_network:
+                #调用neutronclient获取子网的cidr
+                subnet = neutron_api.get_subnet_by_id(cluster.network_config.admin_subnet_id)
+                tfvars.subnet_cidr = subnet["cidr"]
+
             #组装cluster信息为ClusterTFVarsObject格式
             if cluster.type == "baremetal":
                 tfvars.number_of_k8s_masters = 0
@@ -745,7 +818,7 @@ class ClusterService:
             # 3. 调用Celery任务异步处理
             result = celery_app.send_task(
                 "dingo_command.celery_api.workers.add_existing_nodes", 
-                args=[cluster_id, server_details]
+                args=[cluster_id, server_details, user, private_key if private_key else "", password if password else ""]
             )
             
             return {
@@ -782,7 +855,7 @@ class ClusterService:
         else:
             cluster_info_db.kube_info = None
         # 计算集群中的cpu、mem、gpu、gpu_mem
-        nova_client = NovaClient()
+
         cpu_total = 0
         mem_total = 0
         gpu_total = 0
@@ -790,29 +863,23 @@ class ClusterService:
         for idx, node in enumerate(cluster.node_config):
             # 在这里添加master节点的cpu、mem等信息
             if node.role == "master" and node.type == "vm":
-                cpu, gpu, mem, disk, flavor_id = self.get_master_flavor_info(node.flavor_id)
+                cpu, gpu, mem, disk = nova_client.get_flavor_info(node.flavor_id)
                 cpu_total += cpu * node.count
                 mem_total += mem * node.count
                 gpu_total += gpu * node.count
             if node.role == "worker" and node.type == "vm":
-                flavor = nova_client.nova_get_flavor(node.flavor_id)
-                if flavor is not None:
-                    cpu_total = cpu_total + flavor['vcpus'] * node.count
-                    mem_total = mem_total + flavor['ram'] * node.count
-                    if "extra_specs" in flavor and "pci_passthrough:alias" in flavor["extra_specs"]:
-                        pci_alias = flavor['extra_specs']['pci_passthrough:alias']
-                        if ':' in pci_alias:
-                            gpu_value = pci_alias.split(':')[1].strip("'")
-                            gpu_total = gpu_total + int(gpu_value) *  node.count
+                cpu, gpu, mem, disk = nova_client.get_flavor_info(node.flavor_id)
+                cpu_total = cpu_total + cpu * node.count
+                mem_total = mem_total + mem * node.count
+                gpu_total = gpu_total + gpu * node.count
                     #gpu_mem_total += flavor['extra_specs']['gpu_mem']
                 #查询flavor信息
             elif node.role == "worker" and node.type == "baremetal":
-                flavor = nova_client.nova_get_flavor(node.flavor_id)
-                cpu_total = cpu_total + flavor['vcpus'] * node.count
-                mem_total = mem_total + flavor['ram'] * node.count
-                if "extra_specs" in flavor and "resources:GPU" in flavor["extra_specs"]:
-                    gpu_value = int(flavor["extra_specs"])
-                    gpu_total = gpu_total + int(gpu_value) *  node.count
+                cpu, gpu, mem, disk = nova_client.get_flavor_info(node.flavor_id)
+                cpu_total = cpu_total + cpu * node.count
+                mem_total = mem_total + mem * node.count
+                gpu_total = gpu_total + gpu * node.count
+
         cluster_info_db.gpu = gpu_total
         cluster_info_db.cpu = cpu_total
         cluster_info_db.mem = mem_total
@@ -831,8 +898,8 @@ class ClusterService:
         cluster_new = copy.deepcopy(cluster)
         for idx, node in enumerate(cluster.node_config):
             if node.role == "worker" and node.type == "vm":
-                cpu, gpu, mem, disk = self.get_flavor_info(node.flavor_id)
-                operation_system = self.get_image_info(node.image)
+                cpu, gpu, mem, disk = nova_client.get_flavor_info(node.flavor_id)
+                operation_system = nova_client.get_image_info(node.image)
                 for i in range(node.count):
                     if cluster.port_forwards is not None:
                         for index, port_forward in enumerate(cluster.port_forwards):
@@ -849,7 +916,8 @@ class ClusterService:
                         port_forwards=cluster_new.port_forwards,
                         use_local_disk = node.use_local_disk,
                         volume_size=node.volume_size,
-                        volume_type=node.volume_type
+                        volume_type=node.volume_type,
+                        data_volumes=node.data_volumes if hasattr(node, 'data_volumes') and node.data_volumes else []
                     )
                     instance_db = InstanceDB()
                     instance_db.id = str(uuid.uuid4())
@@ -878,8 +946,8 @@ class ClusterService:
                     cluster_new = copy.deepcopy(cluster)
                     node_index = node_index + 1
             if node.role == "worker" and node.type == "baremetal":
-                cpu, gpu, mem, disk = self.get_flavor_info(node.flavor_id)
-                operation_system = self.get_image_info(node.image)
+                cpu, gpu, mem, disk = nova_client.get_flavor_info(node.flavor_id)
+                operation_system = nova_client.get_image_info(node.image)
                 for i in range(node.count):
                     if cluster.port_forwards is not None:
                         for index, port_forward in enumerate(cluster.port_forwards):
@@ -951,36 +1019,6 @@ class ClusterService:
         res = ParamSQL.list()
         return res[1]
 
-    def get_flavor_info(self, flavor_id):
-        nova_client = NovaClient()
-        flavor = nova_client.nova_get_flavor(flavor_id)
-        cpu = 0
-        gpu = 0
-        mem = 0
-        disk = 0
-        if flavor is not None:
-            cpu = flavor['vcpus']
-            mem = flavor['ram']
-            disk = flavor['disk']
-            if "extra_specs" in flavor and "pci_passthrough:alias" in flavor["extra_specs"]:
-                pci_alias = flavor['extra_specs']['pci_passthrough:alias']
-                if ':' in pci_alias:
-                    gpu = pci_alias.split(':')[1]
-        return int(cpu), int(gpu), int(mem), int(disk)
-
-    def get_image_info(self, image_id):
-        operation_system = ""
-        nova_client = NovaClient()
-        image = nova_client.glance_get_image(image_id)
-        if image is not None:
-            if image.get("os_version"):
-                operation_system = image.get("os_version")
-            elif image.get("os_distro"):
-                operation_system = image.get("os_distro")
-            else:
-                operation_system = image.get("name")
-        return operation_system
-
     def get_key_file(self, cluster_id:str, instance_id:str):
         # 根据id查询集群
         if  instance_id is not None and not cluster_id:
@@ -1019,36 +1057,45 @@ class ClusterService:
                 raise Fail("找不到集群对应的私钥文件")
         return private_key
 
-    def get_master_flavor_info(self, master_flavor_name):
-        nova_client = NovaClient()
-        flavor = nova_client.nova_get_flavor(master_flavor_name)
-        cpu = 0
-        gpu = 0
-        mem = 0
-        disk = 0
-        if flavor is not None:
-            cpu = flavor['vcpus']
-            mem = flavor['ram']
-            disk = flavor['disk']
-            if "extra_specs" in flavor and "pci_passthrough:alias" in flavor["extra_specs"]:
-                pci_alias = flavor['extra_specs']['pci_passthrough:alias']
-                if ':' in pci_alias:
-                    gpu = pci_alias.split(':')[1]
-        return int(cpu), int(gpu), int(mem), int(disk), flavor.get("id")
+    def create_cluster_with_netns(self, cluster: ClusterObject, token):
+        """
+        在集群网络命名空间中创建集群
+        """
+        with self.enter_cluster_netns(cluster.id if hasattr(cluster, 'id') else None):
+            return self.create_cluster(cluster, token)
 
-    def get_master_image_info(self, master_image_name):
-        operation_system = ""
-        nova_client = NovaClient()
-        image = nova_client.glance_get_image(master_image_name)
-        if image:
-            if image.get("os_version"):
-                operation_system = image.get("os_version")
-            elif image.get("os_distro"):
-                operation_system = image.get("os_distro")
-            else:
-                operation_system = image.get("name")
-        return operation_system, image.get("id")
+    def delete_cluster_with_netns(self, cluster_id, token):
+        """
+        在集群网络命名空间中删除集群
+        """
+        with self.enter_cluster_netns(cluster_id):
+            return self.delete_cluster(cluster_id, token)
 
+    def add_existing_nodes_with_netns(self, cluster_id: str, server_details: list, token: str, private_key=None, user=None, password=None):
+        """
+        在集群网络命名空间中添加现有节点
+        """
+        with self.enter_cluster_netns(cluster_id):
+            return self.add_existing_nodes_to_cluster(cluster_id, server_details, token, private_key, user, password)
+
+    def get_cluster_with_netns(self, cluster_id):
+        """
+        在集群网络命名空间中获取集群信息
+        """
+        with self.enter_cluster_netns(cluster_id):
+            return self.get_cluster(cluster_id)
+
+    def make_cluster_request(self, cluster_id, request_func, *args, **kwargs):
+        """
+        通用方法：在集群网络命名空间中执行请求
+        
+        Args:
+            cluster_id: 集群ID
+            request_func: 要执行的函数
+            *args, **kwargs: 传递给函数的参数
+        """
+        with self.enter_cluster_netns(cluster_id):
+            return request_func(*args, **kwargs)
 
 class TaskService:
     
@@ -1322,3 +1369,4 @@ class TaskService:
             import traceback
             traceback.print_exc()
             raise e
+

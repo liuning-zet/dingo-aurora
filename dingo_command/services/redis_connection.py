@@ -2,6 +2,7 @@
 import redis
 import uuid
 import time
+from redis.sentinel import Sentinel
 
 from dingo_command.services import CONF
 
@@ -9,12 +10,46 @@ from dingo_command.services import CONF
 REDIS_HOST = CONF.redis.redis_ip
 REDIS_PORT = CONF.redis.redis_port
 REDIS_PASSWORD = CONF.redis.redis_password
+SENTINEL_URL = CONF.redis.sentinel_url
 
 # Redis连接工具
 class RedisConnection:
 
     # 创建redis连接
     redis_connection = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, db=0, decode_responses=True)
+    # 创建redis的master连接
+    redis_master_connection = None
+
+    # 初始化方法
+    def __init__(self):
+        """初始化Redis连接"""
+        self._init_sentinel_connection()
+
+    # 初始化连接主
+    def _init_sentinel_connection(self):
+        """初始化Sentinel连接"""
+        # 解析Sentinel节点配置
+        sentinel_nodes = []
+        sentinel_password = None
+        for url in SENTINEL_URL.split(';'):
+            # 判空
+            if not url:
+                continue
+            # 解析 sentinel://:password@host:port
+            parts = url.split('://:')[1].split('@')
+            sentinel_password = parts[0]
+            host, port = parts[1].split(':')
+            sentinel_nodes.append((host, int(port)))
+        # 获取连接
+        try:
+            # 创建Sentinel连接
+            sentinel = Sentinel(sentinel_nodes, socket_timeout=0.5, password=sentinel_password)
+            # 获取master连接 在config文件中查看 主从名是kolla
+            self.redis_master_connection = sentinel.master_for( "kolla", socket_timeout=0.5, password=sentinel_password, db=0, decode_responses=True)
+            print("Redis Sentinel connection success")
+        except Exception as e:
+            raise ConnectionError(f"Redis Sentinel connection failed: {str(e)}")
+
 
     # 从redis中读取
     def get_redis_by_key(self, redis_key:str):
@@ -22,9 +57,9 @@ class RedisConnection:
         if not redis_key:
             return None
         # 判断redis存在当前key
-        if self.redis_connection.exists(redis_key):
+        if self.redis_master_connection.exists(redis_key):
             # 返回数据
-            return self.redis_connection.get(redis_key)
+            return self.redis_master_connection.get(redis_key)
 
     # 向redis中写入
     def set_redis_by_key(self, redis_key:str, redis_value):
@@ -35,7 +70,7 @@ class RedisConnection:
         if not redis_key:
             return None
         # 返回数据
-        return self.redis_connection.set(redis_key, redis_value)
+        return self.redis_master_connection.set(redis_key, redis_value)
 
     def set_redis_by_key_with_expire(self, redis_key: str, redis_value, expire_seconds=None):
         """
@@ -55,12 +90,12 @@ class RedisConnection:
         try:
             if expire_seconds is not None:
                 # 使用setex命令同时设置值和过期时间[6,7](@ref)
-                return self.redis_connection.setex(redis_key, expire_seconds, redis_value)
+                return self.redis_master_connection.setex(redis_key, expire_seconds, redis_value)
             else:
                 # 不使用过期时间
-                return self.redis_connection.set(redis_key, redis_value)
+                return self.redis_master_connection.set(redis_key, redis_value)
         except Exception as e:
-            print(f"Redis set operation failed: {e}")
+            print(f"Redis set operation failed, redis_key:{redis_key}, redis_value:{redis_value}, expire_seconds:{expire_seconds} error:: {e}")
             return False
 
     def delete_redis_key(self, redis_key: str) -> bool:
@@ -78,7 +113,7 @@ class RedisConnection:
             return False
 
         try:
-            result = self.redis_connection.delete(redis_key)
+            result = self.redis_master_connection.delete(redis_key)
             return True
         except Exception as e:
             print(f"Redis delete operation failed: {e}")

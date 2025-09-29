@@ -1,9 +1,12 @@
+import time
 import json
 import os
 import uuid
 import subprocess
 import requests
 import shutil
+import socket
+import ipaddress
 from requests.auth import HTTPBasicAuth
 from datetime import datetime
 from math import ceil
@@ -82,12 +85,12 @@ async def create_harbor_repo(repo_name=util.repo_global_name, url=harbor_url, us
         await ChartService().handle_oci_repo(repo_info_db)
         Log.info("finished add global repo with harbor")
     except asyncio.TimeoutError as e:
-        Log.error("Harbor API请求超时，请检查网络或Harbor服务状态")
+        Log.error("Harbor API request time out，please check.")
         raise e
     except Exception as e:
         import traceback
         traceback.print_exc()
-        Log.error("add global repo with harbor failed, reason %s" % str(e))
+        Log.error("add global repo with harbor failed, reason %s", str(e))
         raise e
 
 def create_tag_info():
@@ -132,6 +135,41 @@ def is_valid_url(url):
     except Exception:
         return False
 
+def get_ip_from_domain(domain):
+    """
+    通过域名解析获取IP地址
+    :param domain: 输入的域名
+    :return: 解析得到的IP地址字符串，解析失败返回None
+    """
+    try:
+        # 使用socket库的gethostbyname函数进行DNS解析
+        ip_addr = socket.gethostbyname(domain)
+        return ip_addr
+    except socket.gaierror:
+        # 处理域名解析错误（例如域名不存在或网络问题）
+        print(f"error with domain '{domain}'")
+        return None
+    except Exception as e:
+        # 捕获其他潜在异常
+        print(f"unkonw error: {e}")
+        return None
+
+def is_internal_ip(ip_str):
+    """
+    判断一个IP地址是否为内网地址
+    :param ip_str: 待检查的IP地址字符串
+    :return: 如果是内网IP返回True，否则返回False
+    """
+    try:
+        # 使用ipaddress库创建IP地址对象
+        ip_obj = ipaddress.ip_address(ip_str)
+        # 使用is_private属性判断是否为私有地址
+        return ip_obj.is_private
+    except ValueError:
+        # 处理无效的IP地址格式
+        print(f"error: '{ip_str}' is not a valid IP address format")
+        return False
+
 
 class ChartService:
 
@@ -161,7 +199,9 @@ class ChartService:
             if page and page_size:
                 res['currentPage'] = page
                 res['pageSize'] = page_size
-                res['totalPages'] = ceil(count / int(page_size))
+                res['totalPages'] = ceil(count / abs(int(page_size)))
+                if page_size == -1:
+                    res['totalPages'] = 1
             res['total'] = count
             res['data'] = data
             return res
@@ -197,7 +237,9 @@ class ChartService:
             if page and page_size:
                 res['currentPage'] = page
                 res['pageSize'] = page_size
-                res['totalPages'] = ceil(count / int(page_size))
+                res['totalPages'] = ceil(count / abs(int(page_size)))
+                if page_size == -1:
+                    res['totalPages'] = 1
             res['total'] = count
             res['data'] = data
             return res
@@ -216,7 +258,9 @@ class ChartService:
             if page and page_size:
                 res['currentPage'] = page
                 res['pageSize'] = page_size
-                res['totalPages'] = ceil(count / int(page_size))
+                res['totalPages'] = ceil(count / abs(int(page_size)))
+                if page_size == -1:
+                    res['totalPages'] = 1
             res['total'] = count
             res['data'] = data
             return res
@@ -235,7 +279,9 @@ class ChartService:
             if page and page_size:
                 res['currentPage'] = page
                 res['pageSize'] = page_size
-                res['totalPages'] = ceil(count / int(page_size))
+                res['totalPages'] = ceil(count / abs(int(page_size)))
+                if page_size == -1:
+                    res['totalPages'] = 1
             res['total'] = count
             res['data'] = data
             return res
@@ -291,9 +337,9 @@ class ChartService:
                 raise ValueError(f"{project_name} project not found")
 
         except asyncio.TimeoutError:
-            raise TimeoutError(f"访问 Harbor API 超时（3秒）: {harbor_api_url}")
+            raise TimeoutError(f"Access to Harbor API timeout (3 seconds): {harbor_api_url}")
         except Exception as e:
-            raise RuntimeError(f"请求失败: {str(e)}")
+            raise RuntimeError(f"Request failed: {str(e)}")
 
     async def check_repo_args(self, repo: CreateRepoObject):
         if repo.type not in (util.repo_type_http, util.repo_type_oci):
@@ -320,9 +366,9 @@ class ChartService:
                 if r.name == repo.name and r.cluster_id == repo.cluster_id:
                     # 如果查询结果不为空，说明仓库名称已存在+
                     raise ValueError("Repo name already exists")
-                # if r.url == repo.url and r.cluster_id == repo.cluster_id:
-                #     # 如果查询结果不为空，说明仓库地址已存在
-                #     raise ValueError(f"The same repo url already exists, repo name is {r.name}")
+                if r.url == repo.url and r.cluster_id == repo.cluster_id:
+                    # 如果查询结果不为空，说明仓库地址已存在
+                    raise ValueError(f"The same url of repo already exists, repo name is {r.name}")
 
     def convert_repo_db(self, repo: CreateRepoObject, status="creating"):
         repo_info_db = RepoDB()
@@ -589,7 +635,8 @@ class ChartService:
                         task = asyncio.create_task(
                             asyncio.wait_for(
                                 client.get_artifacts(project_name=project_name,
-                                                     repository_name=repository.name.split(f"{project_name}/")[1],
+                                                     repository_name=repository.name.split(f"{project_name}/",
+                                                                                           1)[1],
                                                      with_label=True), timeout=util.repo_time_out)
                         )
                         artifact_tasks.append(task)
@@ -634,29 +681,50 @@ class ChartService:
                         chart_info_db = self.convert_db_harbor(chartname, dict_version, repo_info_db, prefix_name)
                         chart_list.append(chart_info_db)
                     ChartSQL.create_chart_list(chart_list)
+                    # 在这里添加同步已安装的app里面的chart_id，所有的关于这个repo的app都要重新同步下chart_id，
+                    # 根据repo_id和chart_name来匹配，如果匹配不到就跳过，匹配到了就更新chart_id
+                    query_params = {}
+                    query_params["repo_id"] = repo_info_db.id
+                    result = self.list_charts(query_params, 1, -1, None, None)
+                    chart_list = result.get("data")
+                    res = self.list_apps(query_params, 1, -1, None, None)
+                    if res.get("data"):
+                        app_list = []
+                        apps_data = res.get("data")
+                        for app in apps_data:
+                            for chart in chart_list:
+                                if chart.name == app.chart_name:
+                                    app.chart_id = chart.id
+                                    app_list.append(app)
+                                    break
+                        if app_list:
+                            AppSQL.update_app_list(app_list)
                     repo_info_db.status = util.repo_status_success
                     repo_info_db.status_msg = ""
                     RepoSQL.update_repo(repo_info_db)
                     break
                 except asyncio.TimeoutError as e:
                     e_object = e
-                    Log.error("Harbor API请求超时，请检查网络或Harbor服务状态")
+                    Log.error("Harbor API request time out，please check.")
                     try_times += 1
+                    time.sleep(3)
                 except HTTPStatusError as e:
                     e_object = e
-                    Log.error(f"Harbor API请求失败: {e}")
+                    Log.error("Harbor API request time out: %s", str(e))
                     try_times += 1
+                    time.sleep(3)
                 except Exception as e:
                     e_object = e
-                    Log.error(f"other failed: {e}")
+                    Log.error("other failed: %s", str(e))
                     try_times += 1
+                    time.sleep(3)
             if try_times >= util.try_times:
                 raise ValueError(f"{str(e_object)}")
 
         except Exception as e:
             import traceback
             traceback.print_exc()
-            Log.error("add global repo with harbor failed, reason %s" % str(e))
+            Log.error("add global repo with harbor failed, reason %s", str(e))
             raise e
 
     async def create_repo(self, repo: CreateRepoObject, update=False, status="creating"):
@@ -668,11 +736,11 @@ class ChartService:
             repo_info_db.update_time = datetime.now()
             RepoSQL.update_repo(repo_info_db)
         if not update:
-            Log.info("add repo started, repo id %s, name %s, url %s" % (repo_info_db.id,  repo.name, repo.url))
+            Log.info("add repo started, repo id %s, name %s, url %s", repo_info_db.id,  repo.name, repo.url)
         elif status == "updating":
-            Log.info("update repo started, repo id %s, name %s, url %s" % (repo_info_db.id,  repo.name, repo.url))
+            Log.info("update repo started, repo id %s, name %s, url %s", repo_info_db.id,  repo.name, repo.url)
         else:
-            Log.info("sync repo started, repo id %s, name %s, url %s" % (repo_info_db.id,  repo.name, repo.url))
+            Log.info("sync repo started, repo id %s, name %s, url %s", repo_info_db.id,  repo.name, repo.url)
         try:
             chart_list = []
             if repo.type == util.repo_type_http:
@@ -707,6 +775,26 @@ class ChartService:
                     chart_info_db = self.convert_chart_db(chart_name, dict_version, repo_info_db)
                     chart_list.append(chart_info_db)
                 ChartSQL.create_chart_list(chart_list)
+                # 在这里添加同步已安装的app里面的chart_id，所有的关于这个repo的app都要重新同步下chart_id，
+                # 根据repo_id和chart_name来匹配，如果匹配不到就跳过，匹配到了就更新chart_id
+                query_params = {}
+                query_params["repo_id"] = repo_info_db.id
+                query_params = {}
+                query_params["repo_id"] = repo_info_db.id
+                result = self.list_charts(query_params, 1, -1, None, None)
+                chart_list = result.get("data")
+                res = self.list_apps(query_params, 1, -1, None, None)
+                if res.get("data"):
+                    app_list = []
+                    apps_data = res.get("data")
+                    for app in apps_data:
+                        for chart in chart_list:
+                            if chart.name == app.chart_name:
+                                app.chart_id = chart.id
+                                app_list.append(app)
+                                break
+                    if app_list:
+                        AppSQL.update_app_list(app_list)
                 repo_info_db.status = util.repo_status_success
                 repo_info_db.status_msg = ""
                 RepoSQL.update_repo(repo_info_db)
@@ -714,18 +802,18 @@ class ChartService:
                 # 处理oci类型的repo仓库，并添加repo的chart到数据库中
                 await self.handle_oci_repo(repo_info_db)
             if not update:
-                Log.info("add repo success, repo id %s, name %s, url %s" % (repo_info_db.id, repo.name, repo.url))
+                Log.info("add repo success, repo id %s, name %s, url %s", repo_info_db.id, repo.name, repo.url)
             elif status == "updating":
-                Log.info("update repo success, repo id %s, name %s, url %s" % (repo_info_db.id, repo.name, repo.url))
+                Log.info("update repo success, repo id %s, name %s, url %s", repo_info_db.id, repo.name, repo.url)
             else:
-                Log.info("sync repo success, repo id %s, name %s, url %s" % (repo_info_db.id, repo.name, repo.url))
+                Log.info("sync repo success, repo id %s, name %s, url %s", repo_info_db.id, repo.name, repo.url)
         except Exception as e:
             import traceback
             traceback.print_exc()
             repo_info_db.status = "failed"
             repo_info_db.status_msg = str(e)
             RepoSQL.update_repo(repo_info_db)
-            Log.error("add or update or sync repo failed, reason %s" % str(e))
+            Log.error("add or update or sync repo failed, reason %s", str(e))
             raise e
 
     async def create_repo_list(self, repo_list: List[CreateRepoObject], update=False, status="creating"):
@@ -769,7 +857,7 @@ class ChartService:
                     list_chart_version.append(chart_version_info)
                 readme_content, values_dict = self.get_chart_details(chart_data.name, chart_url, username, password,
                                                                      chart_data.latest_version)
-                if not readme_content or not values_dict:
+                if not readme_content and not values_dict:
                     raise ValueError(f"get chart {chart_data.name} failed, please check")
             else:
                 # 处理oci类型的chart应用展示
@@ -786,7 +874,7 @@ class ChartService:
                     list_chart_version.append(chart_version_info)
                 readme_content, values_dict = self.get_chart_oci_details(chart_readme_url, chart_values_url,
                                                                          username, password)
-                if not readme_content or not values_dict:
+                if not readme_content and not values_dict:
                     raise ValueError(f"get oci chart {chart_data.name} failed, please check")
 
             chart_object = ChartObject(
@@ -912,7 +1000,7 @@ class ChartService:
                 response.raise_for_status()
                 return url, response.text
             except Exception as e:
-                raise RuntimeError(f"请求失败 {url}: {str(e)}")
+                raise RuntimeError(f"Request failed {url}: {str(e)}")
 
         try:
             # 准备要并发的URL列表
@@ -928,14 +1016,21 @@ class ChartService:
                     results[url] = content
 
             # 提取并处理结果
+            # 先判断chart_readme_url有没有值，如果没有再判断chart_values_url
+            if chart_readme_url:
+                parsed_url = urlparse(chart_readme_url)
+                domain = parsed_url.netloc
+            else:
+                parsed_url = urlparse(chart_values_url)
+                domain = parsed_url.netloc
             chart_readme = results[chart_readme_url]
             values_content = results[chart_values_url]
+            values_content = values_content.replace(util.harbor_url, domain)
             index_data = json.dumps(yaml.safe_load(values_content))
-
             return chart_readme, index_data
 
         except Exception as e:
-            raise RuntimeError(f"获取Chart详情失败: {str(e)}")
+            raise RuntimeError(f"Failed to get Chart details: {str(e)}")
 
     def get_chart_version(self, chart_id, chart_version):
         # 声明查询条件的dict
@@ -978,12 +1073,12 @@ class ChartService:
                     if version == chart_version:
                         chart_readme_url = create_time_info.get("readme_url")
                         chart_values_url = create_time_info.get("values_url")
-                if not chart_readme_url or not chart_values_url:
+                if not chart_readme_url and not chart_values_url:
                     raise ValueError(f"get oci chart {chart_data.name} content failed, please check")
                 readme_content, values_dict = self.get_chart_oci_details(chart_readme_url, chart_values_url,
                                                                          username, password)
-                if not readme_content or not values_dict:
-                    raise ValueError(f"get oci chart {chart_data.name} failed, please check")
+                if not readme_content and not values_dict:
+                    raise ValueError(f"get oci chart detail {chart_data.name} failed, please check")
 
             chart_object = ChartObject(
                 metadata=chart_metadata,
@@ -1046,10 +1141,14 @@ class ChartService:
         helm_cache_dir = os.path.join(WORK_DIR, "ansible-deploy/inventory/", cluster_id, util.helm_cache)
         os.makedirs(helm_cache_dir, exist_ok=True)
         kube_config = os.path.join(WORK_DIR, "ansible-deploy/inventory/", cluster_id, "kube_config")
+        netns = "qdhcp-" + str(res_cluster.network_config.admin_network_id)
+        if os.path.exists(kube_config):
+            return kube_config, helm_cache_dir, netns
         with open(kube_config, "w") as f :
             f.write(res_cluster.kube_info.kube_config)
             # f.write(yaml.dump(json.loads(res_cluster.kube_info.kube_config)))
-        return kube_config, helm_cache_dir
+        # set_netns(netns)
+        return kube_config, helm_cache_dir, netns
 
     def convert_app_db(self, create_data: ChartDB, create_info: CreateAppObject, update=False):
         app_db = AppDB()
@@ -1091,7 +1190,7 @@ class ChartService:
                 "--password", password,
                 "--registry-config", config
             ]
-            Log.info("helm cmd: %s" % " ".join(cmd_list))
+            Log.info("helm cmd: %s", " ".join(cmd_list))
             result = subprocess.run(cmd_list, capture_output=True, text=True)
             if result.returncode != 0:
                 raise ValueError(result.stderr)
@@ -1099,7 +1198,7 @@ class ChartService:
             raise e
 
     def run_helm_upgrade(self, release_name, remote_url, version, config, helm_cache_dir, kube_config, values,
-                         namespace, username=None, password=None):
+                         namespace, netns, username=None, password=None):
         """执行 Helm 升级/安装操作"""
         values_yaml = str(uuid.uuid4()) + ".yaml"
         value_yaml = os.path.join(helm_cache_dir, values_yaml)
@@ -1108,6 +1207,10 @@ class ChartService:
         # 定义 Helm 命令参数
         if username and password:
             helm_command = [
+                'ip',
+                'netns',
+                'exec',
+                netns,
                 "helm",
                 "upgrade",
                 release_name,
@@ -1125,6 +1228,10 @@ class ChartService:
             ]
         else:
             helm_command = [
+                'ip',
+                'netns',
+                'exec',
+                netns,
                 "helm",
                 "upgrade",
                 release_name,
@@ -1139,7 +1246,7 @@ class ChartService:
                 "--namespace", namespace,
                 "-f", value_yaml
             ]
-        Log.info("helm cmd: %s" % " ".join(helm_command))
+        Log.info("helm cmd: %s", " ".join(helm_command))
         try:
             # 执行命令并捕获输出
             result = subprocess.run(
@@ -1153,24 +1260,27 @@ class ChartService:
             raise e
 
     def install_chart_app(self, app_type, repo_url, remote_url, name, version, values, kube_config, helm_cache_dir,
-                          username, password, namespace):
+                          username, password, namespace, netns):
         # 根据type类型判断下如何处理，如果是http的如何处理？
         # 如果是oci的如何处理？需要仔细的处理清楚
         # 还有带不带--plain-http也需要考虑进去
+        config = os.path.join(helm_cache_dir, util.registry_config)
+        helm_cache_tmp_dir = os.path.join(helm_cache_dir, str(uuid.uuid4()))
+        os.makedirs(helm_cache_tmp_dir, exist_ok=True)
         try:
-            config = os.path.join(helm_cache_dir, util.registry_config)
             if app_type == util.repo_type_http:
-                self.run_helm_upgrade(name, remote_url, version, config, helm_cache_dir, kube_config, values, namespace
-                                      , username, password)
+                self.run_helm_upgrade(name, remote_url, version, config, helm_cache_tmp_dir, kube_config, values,
+                                      namespace, netns, username, password)
             else:
                 # 1、先要login登录harbor上才行
                 self.login_registry(repo_url, username, password, config)
                 # 2、执行命令
-                self.run_helm_upgrade(name, remote_url, version, config, helm_cache_dir, kube_config, values, namespace)
+                self.run_helm_upgrade(name, remote_url, version, config, helm_cache_tmp_dir, kube_config, values,
+                                      namespace, netns)
             # 清除安装产生的缓存文件
-            shutil.rmtree(helm_cache_dir)
+            shutil.rmtree(helm_cache_tmp_dir)
         except Exception as e:
-            shutil.rmtree(helm_cache_dir)
+            shutil.rmtree(helm_cache_tmp_dir)
             raise e
 
     def install_app(self, create_data: CreateAppObject, update=False):
@@ -1184,14 +1294,14 @@ class ChartService:
             AppSQL.create_app(app_info_db)
         try:
             # 1、先获取cluster_id的信息，拿到kube-config文件
-            kube_config, helm_cache_dir = self.get_kubeconfig(create_data.cluster_id)
+            kube_config, helm_cache_dir, netns = self.get_kubeconfig(create_data.cluster_id)
             # 2、根据chart_id和chart_version信息来指定安装，根据类型区分https和http，http类型的也有可能是oci的url的chart包
             app_type, repo_url, remote_url, username, password = self.get_app_data_info(chart_info,
                                                                                         create_data.chart_version)
             # 3、如何使用helm的sdk实现安装应用, 创建cache目录，执行命令时添加这个cache目录执行
             self.install_chart_app(app_type, repo_url, remote_url, create_data.name, create_data.chart_version,
                                    create_data.values, kube_config, helm_cache_dir, username, password,
-                                   create_data.namespace)
+                                   create_data.namespace, netns)
             # 4、如何写入app的状态以及values的信息
             app_info_db.status = util.app_status_success
             app_info_db.status_msg = ""
@@ -1204,19 +1314,25 @@ class ChartService:
             AppSQL.update_app(app_info_db)
             # 清理缓存文件，删除目录等等操作
             if update:
-                Log.error(f"update app error: {str(e)}")
+                Log.error("update app error: %s ", str(e))
                 raise ValueError(f"update app error: {str(e)}")
             else:
-                Log.error(f"install app error: {str(e)}")
+                Log.error("install app error: %s ", str(e))
                 raise ValueError(f"install app error: {str(e)}")
 
-    def uninstall_chart_app(self, name, kube_config, namespace):
+    def uninstall_chart_app(self, name, kube_config, namespace, netns):
         helm_command = [
+            'ip',
+            'netns',
+            'exec',
+            netns,
             "helm",
             "uninstall",
             name,
             "--kubeconfig", kube_config,
-            "--namespace", namespace
+            "--namespace", namespace,
+            "--no-hooks",
+            "--ignore-not-found"
         ]
 
         try:
@@ -1235,22 +1351,27 @@ class ChartService:
         app_data.status = util.app_status_delete
         AppSQL.update_app(app_data)
         try:
-            kube_config, helm_cache_dir = self.get_kubeconfig(app_data.cluster_id)
+            kube_config, helm_cache_dir, netns = self.get_kubeconfig(app_data.cluster_id)
             # 2、根据chart_id和chart_version信息来指定安装，根据类型区分https和http，http类型的也有可能是oci的url的chart包
-            self.uninstall_chart_app(app_data.name, kube_config, app_data.namespace)
+            self.uninstall_chart_app(app_data.name, kube_config, app_data.namespace, netns)
             AppSQL.delete_app(app_data)
         except Exception as e:
             # 写入failed的状态
-            if "not found" in str(e):
+            if "not found" in str(e) or "Release name is invalid" in str(e):
                 AppSQL.delete_app(app_data)
                 return
             app_data.status = util.app_status_failed
             app_data.status_msg = str(e)
             AppSQL.update_app(app_data)
+            Log.error("delete_app error: %s", str(e))
             raise ValueError(f"uninstall app error: {str(e)}")
 
-    def get_info_cmd(self, kube_config, namespace, name):
+    def get_info_cmd(self, kube_config, namespace, name, netns):
         helm_command = [
+            'ip',
+            'netns',
+            'exec',
+            netns,
             "helm",
             "status",
             name,
@@ -1269,13 +1390,14 @@ class ChartService:
         else:
             return result.stdout
 
-    def get_helm_release_manifest(self, release_name, kube_config, namespace='default'):
+    def get_helm_release_manifest(self, release_name, kube_config, netns, namespace='default'):
         """
         获取指定Helm release的所有资源的YAML清单
         """
         try:
             # 构建命令
-            cmd = ['helm', 'get', 'manifest', release_name, '-n', namespace, '--kubeconfig', kube_config]
+            cmd = ['ip', 'netns', 'exec', netns, 'helm', 'get', 'manifest', release_name, '-n', namespace,
+                   '--kubeconfig', kube_config]
             # 执行命令并捕获输出
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             release_manifest = result.stdout
@@ -1291,124 +1413,62 @@ class ChartService:
                     k8s_resources_dict[key] = doc
             return k8s_resources_dict
         except subprocess.CalledProcessError as e:
-            Log.error(f"Error fetching manifest for release {release_name}: {e}")
+            Log.error("Error fetching manifest for release %s: %s", release_name, str(e))
             raise ValueError(f"Error fetching manifest for release {release_name}: {e}")
 
     def get_app_detail(self, app_data: AppDB):
         try:
-            query_params = {}
-            query_params['id'] = app_data.chart_id
-            # 显示repo列表的逻辑
-            data = self.list_charts(query_params, 1, -1, None, None)
-            if data.get("total") > 0:
-                chart_data = data.get("data")[0]
-                # 0、要获取kube_config文件， 执行对应的命令获取下面的资源
-                kube_config, helm_cache_dir = self.get_kubeconfig(app_data.cluster_id)
-                content = self.get_info_cmd(kube_config, app_data.namespace, app_data.name)
-                dict_content = json.loads(content)
-                resourc_obj_list = []
-                dict_yaml_info = self.get_helm_release_manifest(app_data.name, kube_config, app_data.namespace)
-                # 1、获取chart信息
-                update_time = app_data.update_time.isoformat() if app_data.update_time else None
-                app_obj = AppChartObject(
-                    name=chart_data.name,
-                    description=chart_data.description,
-                    repo_name=chart_data.repo_name,
-                    icon=chart_data.icon,
-                    namespace=app_data.namespace,
-                    app_name=app_data.name,
-                    update_time=update_time,
-                    chart_version=app_data.version,
-                    app_version=app_data.app_version
-                )
+            # 0、要获取kube_config文件， 执行对应的命令获取下面的资源
+            kube_config, helm_cache_dir, netns = self.get_kubeconfig(app_data.cluster_id)
+            content = self.get_info_cmd(kube_config, app_data.namespace, app_data.name, netns)
+            dict_content = json.loads(content)
+            resourc_obj_list = []
+            dict_yaml_info = self.get_helm_release_manifest(app_data.name, kube_config, netns, app_data.namespace)
+            # 1、获取chart信息
+            update_time = app_data.update_time.isoformat() if app_data.update_time else None
+            app_obj = AppChartObject(
+                name=app_data.chart_name,
+                description=app_data.description,
+                repo_name=app_data.repo_name,
+                icon=None,
+                namespace=app_data.namespace,
+                app_name=app_data.name,
+                update_time=update_time,
+                chart_version=app_data.version,
+                app_version=app_data.app_version
+            )
 
-                if dict_content.get("info") and dict_content.get("info").get("resources"):
-                    for k, v in dict_content.get("info").get("resources").items():
-                        if "related" in k:
-                            continue
-                        if len(v) > 0:
-                            for vv in v:
-                                if vv.get("status") and vv.get("status").get("phase"):
-                                    if vv.get("status").get("phase") in ("Running", "Succeeded"):
-                                        vv["status"]["phase"] = util.resource_status_active
-                                    elif vv.get("status").get("phase").lower() == "failed":
-                                        vv["status"]["phase"] = util.resource_status_failed
-                                    elif vv.get("status").get("phase").lower() == "unknown":
-                                        vv["status"]["phase"] = util.resource_status_unknown
-                                    else:
-                                        vv["status"]["phase"] = util.resource_status_pend
-                                    resourc_obj = ResourcesObject(
-                                        name=vv.get("metadata").get("name"),
-                                        namespace=vv.get("metadata").get("namespace"),
-                                        kind=vv.get("kind"),
-                                        status=vv.get("status").get("phase"),
-                                        yaml=json.dumps(dict_yaml_info.get(
-                                            f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
-                                    )
-                                    resourc_obj_list.append(resourc_obj)
-                                    continue
+            if dict_content.get("info") and dict_content.get("info").get("resources"):
+                for k, v in dict_content.get("info").get("resources").items():
+                    if "related" in k:
+                        continue
+                    if len(v) > 0:
+                        for vv in v:
+                            if vv.get("status") and vv.get("status").get("phase"):
+                                if vv.get("status").get("phase") in ("Running", "Succeeded"):
+                                    vv["status"]["phase"] = util.resource_status_active
+                                elif vv.get("status").get("phase").lower() == "failed":
+                                    vv["status"]["phase"] = util.resource_status_failed
+                                elif vv.get("status").get("phase").lower() == "unknown":
+                                    vv["status"]["phase"] = util.resource_status_unknown
+                                else:
+                                    vv["status"]["phase"] = util.resource_status_pend
+                                resourc_obj = ResourcesObject(
+                                    name=vv.get("metadata").get("name"),
+                                    namespace=vv.get("metadata").get("namespace"),
+                                    kind=vv.get("kind"),
+                                    status=vv.get("status").get("phase"),
+                                    yaml=json.dumps(dict_yaml_info.get(
+                                        f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
+                                )
+                                resourc_obj_list.append(resourc_obj)
+                                continue
 
-                                if vv.get("status") and vv.get("status") and not vv.get("status").get("phase"):
-                                    if vv.get("status").get("availableReplicas") and vv.get("status").get(
-                                            "availableReplicas") and vv.get("status").get("replicas"):
-                                        if vv.get("status").get("replicas") == vv.get("status").get(
-                                                "readyReplicas") == vv.get("status").get("availableReplicas"):
-                                            resourc_obj = ResourcesObject(
-                                                name=vv.get("metadata").get("name"),
-                                                namespace=vv.get("metadata").get("namespace"),
-                                                kind=vv.get("kind"),
-                                                status=util.resource_status_active,
-                                                yaml=json.dumps(dict_yaml_info.get(
-                                                    f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
-                                            )
-                                            resourc_obj_list.append(resourc_obj)
-                                            continue
-                                        else:
-                                            resourc_obj = ResourcesObject(
-                                                name=vv.get("metadata").get("name"),
-                                                namespace=vv.get("metadata").get("namespace"),
-                                                kind=vv.get("kind"),
-                                                status=util.resource_status_pend,
-                                                yaml=json.dumps(dict_yaml_info.get(
-                                                    f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
-                                            )
-                                            resourc_obj_list.append(resourc_obj)
-                                            continue
-                                    elif vv.get("status").get("unavailableReplicas"):
-                                        resourc_obj = ResourcesObject(
-                                            name=vv.get("metadata").get("name"),
-                                            namespace=vv.get("metadata").get("namespace"),
-                                            kind=vv.get("kind"),
-                                            status=util.resource_status_failed,
-                                            yaml=json.dumps(dict_yaml_info.get(
-                                                f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
-                                        )
-                                        resourc_obj_list.append(resourc_obj)
-                                        continue
-                                    elif "service" in k.lower() and vv.get("spec").get("type") == "LoadBalancer":
-                                        if not vv.get("status").get("loadBalancer"):
-                                            resourc_obj = ResourcesObject(
-                                                name=vv.get("metadata").get("name"),
-                                                namespace=vv.get("metadata").get("namespace"),
-                                                kind=vv.get("kind"),
-                                                status=util.resource_status_pend,
-                                                yaml=json.dumps(dict_yaml_info.get(
-                                                    f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
-                                            )
-                                            resourc_obj_list.append(resourc_obj)
-                                            continue
-                                        else:
-                                            resourc_obj = ResourcesObject(
-                                                name=vv.get("metadata").get("name"),
-                                                namespace=vv.get("metadata").get("namespace"),
-                                                kind=vv.get("kind"),
-                                                status=util.resource_status_active,
-                                                yaml=json.dumps(dict_yaml_info.get(
-                                                    f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
-                                            )
-                                            resourc_obj_list.append(resourc_obj)
-                                            continue
-                                    elif "service" in k.lower() and vv.get("spec").get("type") != "LoadBalancer":
+                            if vv.get("status") and vv.get("status") and not vv.get("status").get("phase"):
+                                if vv.get("status").get("availableReplicas") and vv.get("status").get(
+                                        "availableReplicas") and vv.get("status").get("replicas"):
+                                    if vv.get("status").get("replicas") == vv.get("status").get(
+                                            "readyReplicas") == vv.get("status").get("availableReplicas"):
                                         resourc_obj = ResourcesObject(
                                             name=vv.get("metadata").get("name"),
                                             namespace=vv.get("metadata").get("namespace"),
@@ -1419,57 +1479,52 @@ class ChartService:
                                         )
                                         resourc_obj_list.append(resourc_obj)
                                         continue
-                                    elif "statefulset" in k.lower() and vv.get("status"):
-                                        if vv.get("status").get("replicas") == vv.get("status").get(
-                                                "readyReplicas") == vv.get("status").get("availableReplicas"):
-                                            resourc_obj = ResourcesObject(
-                                                name=vv.get("metadata").get("name"),
-                                                namespace=vv.get("metadata").get("namespace"),
-                                                kind=vv.get("kind"),
-                                                status=util.resource_status_active,
-                                                yaml=json.dumps(dict_yaml_info.get(
-                                                    f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
-                                            )
-                                            resourc_obj_list.append(resourc_obj)
-                                            continue
-                                        else:
-                                            resourc_obj = ResourcesObject(
-                                                name=vv.get("metadata").get("name"),
-                                                namespace=vv.get("metadata").get("namespace"),
-                                                kind=vv.get("kind"),
-                                                status=util.resource_status_pend,
-                                                yaml=json.dumps(dict_yaml_info.get(
-                                                    f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
-                                            )
-                                            resourc_obj_list.append(resourc_obj)
-                                            continue
-                                    elif "daemonset" in k.lower() and vv.get("status"):
-                                        if vv.get("status").get("numberReady") == vv.get("status").get(
-                                                "desiredNumberScheduled") == vv.get("status").get(
-                                                "currentNumberScheduled"):
-                                            resourc_obj = ResourcesObject(
-                                                name=vv.get("metadata").get("name"),
-                                                namespace=vv.get("metadata").get("namespace"),
-                                                kind=vv.get("kind"),
-                                                status=util.resource_status_active,
-                                                yaml=json.dumps(dict_yaml_info.get(
-                                                    f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
-                                            )
-                                            resourc_obj_list.append(resourc_obj)
-                                            continue
-                                        else:
-                                            resourc_obj = ResourcesObject(
-                                                name=vv.get("metadata").get("name"),
-                                                namespace=vv.get("metadata").get("namespace"),
-                                                kind=vv.get("kind"),
-                                                status=util.resource_status_pend,
-                                                yaml=json.dumps(dict_yaml_info.get(
-                                                    f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
-                                            )
-                                            resourc_obj_list.append(resourc_obj)
-                                            continue
-
-                                if vv.get("metadata") and not vv.get("status"):
+                                    else:
+                                        resourc_obj = ResourcesObject(
+                                            name=vv.get("metadata").get("name"),
+                                            namespace=vv.get("metadata").get("namespace"),
+                                            kind=vv.get("kind"),
+                                            status=util.resource_status_pend,
+                                            yaml=json.dumps(dict_yaml_info.get(
+                                                f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
+                                        )
+                                        resourc_obj_list.append(resourc_obj)
+                                        continue
+                                elif vv.get("status").get("unavailableReplicas"):
+                                    resourc_obj = ResourcesObject(
+                                        name=vv.get("metadata").get("name"),
+                                        namespace=vv.get("metadata").get("namespace"),
+                                        kind=vv.get("kind"),
+                                        status=util.resource_status_failed,
+                                        yaml=json.dumps(dict_yaml_info.get(
+                                            f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
+                                    )
+                                    resourc_obj_list.append(resourc_obj)
+                                    continue
+                                elif "service" in k.lower() and vv.get("spec").get("type") == "LoadBalancer":
+                                    if not vv.get("status").get("loadBalancer"):
+                                        resourc_obj = ResourcesObject(
+                                            name=vv.get("metadata").get("name"),
+                                            namespace=vv.get("metadata").get("namespace"),
+                                            kind=vv.get("kind"),
+                                            status=util.resource_status_pend,
+                                            yaml=json.dumps(dict_yaml_info.get(
+                                                f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
+                                        )
+                                        resourc_obj_list.append(resourc_obj)
+                                        continue
+                                    else:
+                                        resourc_obj = ResourcesObject(
+                                            name=vv.get("metadata").get("name"),
+                                            namespace=vv.get("metadata").get("namespace"),
+                                            kind=vv.get("kind"),
+                                            status=util.resource_status_active,
+                                            yaml=json.dumps(dict_yaml_info.get(
+                                                f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
+                                        )
+                                        resourc_obj_list.append(resourc_obj)
+                                        continue
+                                elif "service" in k.lower() and vv.get("spec").get("type") != "LoadBalancer":
                                     resourc_obj = ResourcesObject(
                                         name=vv.get("metadata").get("name"),
                                         namespace=vv.get("metadata").get("namespace"),
@@ -1480,37 +1535,100 @@ class ChartService:
                                     )
                                     resourc_obj_list.append(resourc_obj)
                                     continue
+                                elif "statefulset" in k.lower() and vv.get("status"):
+                                    if vv.get("status").get("replicas") == vv.get("status").get(
+                                            "readyReplicas") == vv.get("status").get("availableReplicas"):
+                                        resourc_obj = ResourcesObject(
+                                            name=vv.get("metadata").get("name"),
+                                            namespace=vv.get("metadata").get("namespace"),
+                                            kind=vv.get("kind"),
+                                            status=util.resource_status_active,
+                                            yaml=json.dumps(dict_yaml_info.get(
+                                                f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
+                                        )
+                                        resourc_obj_list.append(resourc_obj)
+                                        continue
+                                    else:
+                                        resourc_obj = ResourcesObject(
+                                            name=vv.get("metadata").get("name"),
+                                            namespace=vv.get("metadata").get("namespace"),
+                                            kind=vv.get("kind"),
+                                            status=util.resource_status_pend,
+                                            yaml=json.dumps(dict_yaml_info.get(
+                                                f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
+                                        )
+                                        resourc_obj_list.append(resourc_obj)
+                                        continue
+                                elif "daemonset" in k.lower() and vv.get("status"):
+                                    if vv.get("status").get("numberReady") == vv.get("status").get(
+                                            "desiredNumberScheduled") == vv.get("status").get(
+                                            "currentNumberScheduled"):
+                                        resourc_obj = ResourcesObject(
+                                            name=vv.get("metadata").get("name"),
+                                            namespace=vv.get("metadata").get("namespace"),
+                                            kind=vv.get("kind"),
+                                            status=util.resource_status_active,
+                                            yaml=json.dumps(dict_yaml_info.get(
+                                                f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
+                                        )
+                                        resourc_obj_list.append(resourc_obj)
+                                        continue
+                                    else:
+                                        resourc_obj = ResourcesObject(
+                                            name=vv.get("metadata").get("name"),
+                                            namespace=vv.get("metadata").get("namespace"),
+                                            kind=vv.get("kind"),
+                                            status=util.resource_status_pend,
+                                            yaml=json.dumps(dict_yaml_info.get(
+                                                f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
+                                        )
+                                        resourc_obj_list.append(resourc_obj)
+                                        continue
+
+                            if vv.get("metadata") and not vv.get("status"):
                                 resourc_obj = ResourcesObject(
                                     name=vv.get("metadata").get("name"),
                                     namespace=vv.get("metadata").get("namespace"),
                                     kind=vv.get("kind"),
-                                    status=util.resource_status_unknown,
+                                    status=util.resource_status_active,
                                     yaml=json.dumps(dict_yaml_info.get(
                                         f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
                                 )
                                 resourc_obj_list.append(resourc_obj)
+                                continue
+                            resourc_obj = ResourcesObject(
+                                name=vv.get("metadata").get("name"),
+                                namespace=vv.get("metadata").get("namespace"),
+                                kind=vv.get("kind"),
+                                status=util.resource_status_unknown,
+                                yaml=json.dumps(dict_yaml_info.get(
+                                    f"{vv.get('kind')}_{vv.get('metadata').get('name')}"))
+                            )
+                            resourc_obj_list.append(resourc_obj)
 
-                    # 3、把上述的资源信息和chart信息组装成一个对象返回
-                    response_obj = ResponseAppObject(
-                        resources=resourc_obj_list,
-                        values=app_data.values,
-                        chart_info=app_obj
-                    )
-                else:
-                    response_obj = ResponseAppObject(
-                        resources=None,
-                        values=app_data.values,
-                        chart_info=app_obj
-                    )
-                return response_obj
+                # 3、把上述的资源信息和chart信息组装成一个对象返回
+                response_obj = ResponseAppObject(
+                    resources=resourc_obj_list,
+                    values=app_data.values,
+                    chart_info=app_obj
+                )
             else:
-                raise ValueError("chart not found")
+                response_obj = ResponseAppObject(
+                    resources=None,
+                    values=app_data.values,
+                    chart_info=app_obj
+                )
+            return response_obj
 
         except Exception as e:
             raise ValueError(f"get app detail error: {str(e)}")
 
-    def get_helm_list(self, kube_config):
+    def get_helm_list(self, kube_config, netns):
         helm_command = [
+            'ip',
+            'netns',
+            'exec',
+            netns,
             "helm",
             "list",
             "--kubeconfig", kube_config,
@@ -1523,7 +1641,7 @@ class ChartService:
             capture_output=True,
             text=True
         )
-        if result.returncode!= 0:
+        if result.returncode != 0:
             raise ValueError(result.stderr)
 
         return result.stdout

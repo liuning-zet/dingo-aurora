@@ -33,6 +33,8 @@ class RepoSQL:
                 query = query.filter(RepoInfo.is_global == query_params["is_global"])
             if "status" in query_params and query_params["status"]:
                 query = query.filter(RepoInfo.status == query_params["status"])
+            if "type" in query_params and query_params["type"]:
+                query = query.filter(RepoInfo.type == query_params["type"])
             if "name" in query_params and query_params["name"]:
                 query = query.filter(RepoInfo.name.like(f"%{query_params['name']}%"))
             # 总数
@@ -306,6 +308,18 @@ class AppSQL:
         session = get_session()
         with session.begin():
             session.merge(app)
+
+    @classmethod
+    def update_app_list(cls, app_list):
+        session = get_session()
+        try:
+            with session.begin():
+                # 使用bulk_save_objects替代循环merge
+                session.bulk_save_objects(app_list, update_changed_only=True)
+        except Exception as e:
+            Log.error("update_app_list failed, error: %s" % str(e))
+            session.rollback()
+            raise
 
     @classmethod
     def delete_app_list(cls, app_list):

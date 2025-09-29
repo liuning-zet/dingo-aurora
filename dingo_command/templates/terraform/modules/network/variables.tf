@@ -21,6 +21,10 @@ variable "port_security_enabled" {
   type = bool
 }
 
+variable "attached_router" {
+  type = bool
+}
+
 variable "subnet_cidr" {}
 
 variable "use_neutron" {}
@@ -45,4 +49,10 @@ variable "auth_url" {
 variable "tenant_id" {
   type    = string
   default = ""
+}
+
+variable "group_vars_path" {
+  description = "path to the inventory group vars directory"
+  type        = string
+  default     = "./group_vars"
 }

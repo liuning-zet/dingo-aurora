@@ -4,7 +4,7 @@ from sqlalchemy import  DateTime
 
 from pydantic import BaseModel, Field
 from dingo_command.api.model.base import DingoopsObject
-from dingo_command.api.model.chart import AppChartObject
+from dingo_command.api.model.chart import CreateAppObject
     
 class NetworkConfigObject(BaseModel):
     admin_subnet_id: Optional[str] = Field(None, description="管理网id")
@@ -26,6 +26,11 @@ class PortForwards(BaseModel):
     protocol: Optional[str] = Field(None, description="协议")
 
 
+class DataVolumes(BaseModel):
+    volume_type: Optional[str] = Field(None, description="卷类型")
+    volume_size: Optional[int] = Field(None, description="卷大小")
+
+
 class NodeConfigObject(BaseModel):
     count: Optional[int] = Field(None, description="项目id")
     image: Optional[str] = Field(None, description="用户id")
@@ -43,6 +48,7 @@ class NodeConfigObject(BaseModel):
     use_local_disk: Optional[bool] = Field(False, description="实例id")
     volume_type: Optional[str] = Field("", description="卷类型")
     volume_size: Optional[int] = Field(0, description="卷大小")
+    data_volumes: Optional[List[DataVolumes]] = Field(None, description="数据卷配置")
     
 class NodeGroup(BaseModel):
     az: Optional[str] = Field(None, description="可用域")
@@ -54,6 +60,7 @@ class NodeGroup(BaseModel):
     use_local_disk: Optional[bool] = Field(None, description="实例id")
     volume_type: Optional[str] = Field(None, description="卷类型")
     volume_size: Optional[int] = Field(None, description="卷大小")
+    data_volumes: Optional[List[DataVolumes]] = Field(None, description="数据卷配置")
 
 class KubeClusterObject(BaseModel):
     kube_lb_address: Optional[str] = Field(None, description="负载均衡器的浮动ip")
@@ -91,7 +98,7 @@ class ClusterObject(DingoopsObject):
     forward_float_ip_id: Optional[str] = Field(None, description="集群浮动ip的id")
     forward_float_ip: Optional[str] = Field(None, description="集群浮动ip")
     port_forwards: Optional[List[PortForwards]] = Field(None, description="端口转发配置")
-    charts: Optional[List[AppChartObject]] = Field(None, description="应用图表配置")
+    charts: Optional[List[CreateAppObject]] = Field(None, description="应用图表配置")
 
 
 class NodeObject(DingoopsObject):

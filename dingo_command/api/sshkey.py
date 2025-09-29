@@ -17,12 +17,12 @@ key_service = KeyService()
 @router.post("/sshkey", summary="创建sshkey", description="创建sshkey")
 async def create_key(key: CreateKeyObject):
     try:
-        Log.info("add key, key info %s" % key)
+        Log.info("add key, key info %s", key)
         return key_service.create_key(key)
     except Exception as e:
         import traceback
         traceback.print_exc()
-        Log.error(f"create key error: {str(e)}")
+        Log.error("create key error: %s", str(e))
         raise HTTPException(status_code=400, detail=f"create key error: {str(e)}")
 
 
@@ -59,7 +59,7 @@ async def list_keys(status: str = Query(None, description="status状态"),
     except Exception as e:
         import traceback
         traceback.print_exc()
-        Log.error(f"list keys error: {str(e)}")
+        Log.error("list keys error: %s", str(e))
         raise HTTPException(status_code=400, detail=f"list keys error: {str(e)}")
 
 
@@ -67,12 +67,12 @@ async def list_keys(status: str = Query(None, description="status状态"),
 async def delete_key(sshkey_id: str):
     try:
         # 删除某个key以及它的数据信息
-        Log.info("delete key, sshkey_id info %s" % sshkey_id)
+        Log.info("delete key, sshkey_id info %s", sshkey_id)
         return key_service.delete_key(sshkey_id)
     except Exception as e:
         import traceback
         traceback.print_exc()
-        Log.error(f"delete key error: {str(e)}")
+        Log.error("delete key error: %s", str(e))
         raise HTTPException(status_code=400, detail=f"delete key error: {str(e)}")
 
 
@@ -80,7 +80,7 @@ async def delete_key(sshkey_id: str):
 async def get_key(sshkey_id: str):
     try:
         # 获取某个key以及它的数据信息
-        Log.info("get key, sshkey_id info %s" % sshkey_id)
+        Log.info("get key, sshkey_id info %s", sshkey_id)
         # 声明查询条件的dict
         query_params = {}
         # 查询条件组装
@@ -94,5 +94,5 @@ async def get_key(sshkey_id: str):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        Log.error(f"get key error: {str(e)}")
+        Log.error("get key error: %s", str(e))
         raise HTTPException(status_code=400, detail=f"get key error: {str(e)}")

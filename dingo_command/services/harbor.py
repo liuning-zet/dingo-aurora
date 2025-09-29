@@ -1,11 +1,17 @@
+import uuid
+from datetime import datetime
+from re import S
 from dingo_command.common.harbor_client import HarborAPI
 from typing import Any
 
 from dingo_command.common import CONF
+from dingo_command.db.models.harbor.models import TenantHarborRelation
+from dingo_command.db.models.harbor.sql import HarborRelationSQL
+from dingo_command.services.custom_exception import Fail
 
 base_url = CONF.harbor.base_url
 clean_url = base_url.split("://", 1)[-1]
-
+private_project_storage_limit = CONF.harbor.storage_limit
 
 # 获取公共基础镜像
 class HarborService:
@@ -132,10 +138,10 @@ class HarborService:
     # 获取公共基础镜像
     def get_public_base_image(
         self,
-        project_name: str = "anc-public",
+        project_name: str = "alayanew-public",
         public_image_name="",
         page: int = 1,
-        page_size: int = 10,
+        page_size: int = 100,
     ) -> dict:
         """
         获取公共基础镜像仓库信息
@@ -182,14 +188,28 @@ class HarborService:
             - 如果镜像没有标签，tag_name和tag_push_time将显示为'none'
             - 返回的数据结构经过优化，便于前端展示和处理
         """
+
+        # 搜索项目
+        repo_count = 0
+        search_response = self.harbor.search(project_name)
+        if search_response["status"]:
+            projects = search_response["data"]["project"]
+            if len(projects) > 0:
+                for project in projects:
+                    if project["name"] == project_name:
+                        repo_count = project["repo_count"]
+            else:
+                return self.return_response(False, 400, "项目不存在")
+        else:
+            return self.return_response(False, 400, "搜索项目失败")
+        
         if public_image_name:
             # project_repositories = self.harbor.get_project_repository(
             #     project_name, public_image_name, page=page, page_size=page_size
             # )
             project_repositories = self.harbor.get_project_repositories(
-                project_name, page=page, page_size=page_size
+                project_name, page=page, page_size=page_size, get_all=True
             )
-
             if not project_repositories["status"]:
                 return project_repositories
 
@@ -221,7 +241,13 @@ class HarborService:
                     tags_list = []
                     # 处理每个镜像标签
                     for artifact in public_project_artifacts["data"]:
+                        labels_list = []
                         tags = artifact.get("tags", [])
+                        labels = artifact.get("labels", [])
+                        digest = artifact.get("digest", "")
+                        if labels:
+                            for label in labels:
+                                labels_list.append(label.get("name"))
                         tags_dic = {}
 
                         if tags:
@@ -229,26 +255,29 @@ class HarborService:
                             tag_name = tags[0]["name"]
                             tag_push_time = tags[0]["push_time"]
                             tags_dic = dict(
-                                tag_name=tag_name, tag_push_time=tag_push_time
+                                tag_name=tag_name, 
+                                tag_push_time=tag_push_time,
+                                labels_list=labels_list,
+                                digest=digest
                             )
-                        else:
-                            # 没有标签的情况
-                            tags_dic = dict(tag_name="none", tag_push_time="none")
+                        # else:
+                        #     # 没有标签的情况
+                        #     tags_dic = dict(tag_name="none", tag_push_time="none")
 
-                        # 获取并格式化镜像大小
-                        size_bytes = artifact.get("size", 0)
-                        # 根据大小动态选择单位
-                        if size_bytes >= 1024 * 1024 * 1024:  # 大于等于1GB
-                            size_formatted = (
-                                f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
-                            )
-                        else:  # 小于1GB，使用MB
-                            size_formatted = f"{size_bytes / (1024 * 1024):.2f} MB"
+                            # 获取并格式化镜像大小
+                            size_bytes = artifact.get("size", 0)
+                            # 根据大小动态选择单位
+                            if size_bytes >= 1024 * 1024 * 1024:  # 大于等于1GB
+                                size_formatted = (
+                                    f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+                                )
+                            else:  # 小于1GB，使用MB
+                                size_formatted = f"{size_bytes / (1024 * 1024):.2f} MB"
 
-                        tags_dic.update(dict(size=size_formatted))
-                        tags_list.append(tags_dic)
+                            tags_dic.update(dict(size=size_formatted))
+                            tags_list.append(tags_dic)
 
-                    # 更新仓库的标签信息
+                    # 更新仓库的标签与labels信息
                     repository.update(dict(tags_list=tags_list))
                     project_repositories_list.append(repository)
 
@@ -258,9 +287,8 @@ class HarborService:
 
         else:
             project_repositories = self.harbor.get_project_repositories(
-                project_name, page=page, page_size=page_size
+                project_name, page=page, page_size=page_size, get_all=False
             )
-
             if not project_repositories["status"]:
                 return project_repositories
 
@@ -291,40 +319,227 @@ class HarborService:
                 tags_list = []
                 # 处理每个镜像标签
                 for artifact in public_project_artifacts["data"]:
+                    labels_list = []
                     tags = artifact.get("tags", [])
+                    labels = artifact.get("labels", [])
+                    digest = artifact.get("digest", "")
+                    if labels:
+                        for label in labels:
+                            labels_list.append(label.get("name"))
                     tags_dic = {}
 
                     if tags:
                         # 获取标签信息
                         tag_name = tags[0]["name"]
                         tag_push_time = tags[0]["push_time"]
-                        tags_dic = dict(tag_name=tag_name, tag_push_time=tag_push_time)
-                    else:
-                        # 没有标签的情况
-                        tags_dic = dict(tag_name="none", tag_push_time="none")
+                        tags_dic = dict(
+                            tag_name=tag_name, 
+                            tag_push_time=tag_push_time,
+                            labels_list=labels_list,
+                            digest=digest
+                        )
+                    # else:
+                    #     # 没有标签的情况
+                    #     tags_dic = dict(tag_name="none", tag_push_time="none")
 
-                    # 获取并格式化镜像大小
-                    size_bytes = artifact.get("size", 0)
-                    # 根据大小动态选择单位
-                    if size_bytes >= 1024 * 1024 * 1024:  # 大于等于1GB
-                        size_formatted = f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
-                    else:  # 小于1GB，使用MB
-                        size_formatted = f"{size_bytes / (1024 * 1024):.2f} MB"
+                        # 获取并格式化镜像大小
+                        size_bytes = artifact.get("size", 0)
+                        # 根据大小动态选择单位
+                        if size_bytes >= 1024 * 1024 * 1024:  # 大于等于1GB
+                            size_formatted = f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+                        else:  # 小于1GB，使用MB
+                            size_formatted = f"{size_bytes / (1024 * 1024):.2f} MB"
 
-                    tags_dic.update(dict(size=size_formatted))
-                    tags_list.append(tags_dic)
+                        tags_dic.update(dict(size=size_formatted))
+                        tags_list.append(tags_dic)
 
-                # 更新仓库的标签信息
+                # 更新仓库的标签与labels信息
                 repository.update(dict(tags_list=tags_list))
                 project_repositories_list.append(repository)
+
+            # return self.return_response(
+            #     True, 200, "获取镜像成功", project_repositories_list
+            # )
+            return {
+                "status": True,
+                "code": 200,
+                "message": "获取公共仓库镜像成功",
+                "page_size": repo_count,
+                "data": project_repositories_list,
+            }
+
+    # 获取私有基础镜像
+    def get_private_base_image(
+        self,
+        project_name: str = "alayanew-public",
+        image_name="",
+        page: int = 1,
+        page_size: int = 100,
+    ) -> dict:
+        repo_count = 0
+        if image_name:
+            project_repositories = self.harbor.get_project_repositories(
+                project_name, page=page, page_size=page_size, get_all=True
+            )
+            if not project_repositories["status"]:
+                return project_repositories
+
+            project_repositories_list = []
+            repo_count = len(project_repositories["data"])
+            # 处理每个镜像仓库
+            for repository in project_repositories["data"]:
+                # 提取仓库名称（去除项目前缀）
+                repository_name = repository["name"].replace(
+                    f"{project_name}/", "", 1
+                )  # 只替换第一个
+
+                if image_name in repository_name:
+                    # 更新仓库信息
+                    repository.update(dict(repository_name=repository_name))
+                    repository.update(dict(project_name=project_name))
+                    repository.update(
+                        dict(
+                            pull_command=f"docker pull {clean_url}/{project_name}/{repository_name}"
+                        )
+                    )
+                    repository.update(dict(image_url=clean_url))
+
+                    # 获取镜像仓库的标签和详细信息
+                    public_project_artifacts = self.harbor.get_repository_artifacts(
+                        project_name, repository_name
+                    )
+
+                    tags_list = []
+                    # 处理每个镜像标签
+                    for artifact in public_project_artifacts["data"]:
+                        labels_list = []
+                        tags = artifact.get("tags", [])
+                        labels = artifact.get("labels", [])
+                        digest = artifact.get("digest", "")
+                        if labels:
+                            for label in labels:
+                                labels_list.append(label.get("name"))
+                        tags_dic = {}
+
+                        if tags:
+                            # 获取标签信息
+                            tag_name = tags[0]["name"]
+                            tag_push_time = tags[0]["push_time"]
+                            tags_dic = dict(
+                                tag_name=tag_name, 
+                                tag_push_time=tag_push_time,
+                                labels_list=labels_list,
+                                digest=digest
+                            )
+                        # else:
+                        #     # 没有标签的情况
+                        #     tags_dic = dict(tag_name="none", tag_push_time="none")
+
+                            # 获取并格式化镜像大小
+                            size_bytes = artifact.get("size", 0)
+                            # 根据大小动态选择单位
+                            if size_bytes >= 1024 * 1024 * 1024:  # 大于等于1GB
+                                size_formatted = (
+                                    f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+                                )
+                            else:  # 小于1GB，使用MB
+                                size_formatted = f"{size_bytes / (1024 * 1024):.2f} MB"
+
+                            tags_dic.update(dict(size=size_formatted))
+                            tags_list.append(tags_dic)
+
+                    # 更新仓库的标签与labels信息
+                    repository.update(dict(tags_list=tags_list))
+                    project_repositories_list.append(repository)
 
             return self.return_response(
                 True, 200, "获取镜像成功", project_repositories_list
             )
 
+        else:
+            project_repositories = self.harbor.get_project_repositories(
+                project_name, page=page, page_size=page_size, get_all=False
+            )
+            if not project_repositories["status"]:
+                return project_repositories
+            repo_count = len(project_repositories["data"])
+            project_repositories_list = []
+
+            # 处理每个镜像仓库
+            for repository in project_repositories["data"]:
+                # 提取仓库名称（去除项目前缀）
+                repository_name = repository["name"].replace(
+                    f"{project_name}/", "", 1
+                )  # 只替换第一个
+
+                # 更新仓库信息
+                repository.update(dict(repository_name=repository_name))
+                repository.update(dict(project_name=project_name))
+                repository.update(
+                    dict(
+                        pull_command=f"docker pull {clean_url}/{project_name}/{repository_name}"
+                    )
+                )
+                repository.update(dict(image_url=clean_url))
+
+                # 获取镜像仓库的标签和详细信息
+                public_project_artifacts = self.harbor.get_repository_artifacts(
+                    project_name, repository_name
+                )
+
+                tags_list = []
+                # 处理每个镜像标签
+                for artifact in public_project_artifacts["data"]:
+                    labels_list = []
+                    tags = artifact.get("tags", [])
+                    labels = artifact.get("labels", [])
+                    digest = artifact.get("digest", "")
+                    if labels:
+                        for label in labels:
+                            labels_list.append(label.get("name"))
+                    tags_dic = {}
+
+                    if tags:
+                        # 获取标签信息
+                        tag_name = tags[0]["name"]
+                        tag_push_time = tags[0]["push_time"]
+                        tags_dic = dict(
+                            tag_name=tag_name, 
+                            tag_push_time=tag_push_time,
+                            labels_list=labels_list,
+                            digest=digest
+                        )
+                    # else:
+                    #     # 没有标签的情况
+                    #     tags_dic = dict(tag_name="none", tag_push_time="none")
+
+                        # 获取并格式化镜像大小
+                        size_bytes = artifact.get("size", 0)
+                        # 根据大小动态选择单位
+                        if size_bytes >= 1024 * 1024 * 1024:  # 大于等于1GB
+                            size_formatted = f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+                        else:  # 小于1GB，使用MB
+                            size_formatted = f"{size_bytes / (1024 * 1024):.2f} MB"
+
+                        tags_dic.update(dict(size=size_formatted))
+                        tags_list.append(tags_dic)
+
+                # 更新仓库的标签与labels信息
+                repository.update(dict(tags_list=tags_list))
+                project_repositories_list.append(repository)
+
+            return {
+                "status": True,
+                "code": 200,
+                "message": "获取私有仓库镜像成功",
+                "page_size": repo_count,
+                "data": project_repositories_list,
+            }
+
     # 添加harbor用户
     def add_harbor_user(
         self,
+        tenant_id: str,
         username: str,
         password: str,
         email: str,
@@ -397,19 +612,25 @@ class HarborService:
             - 建议在生产环境中使用强密码策略
             - 用户创建成功后需要手动分配项目权限
         """
-        result = self.harbor.create_user(
-            username=username,
-            email=email,
-            password=password,
-            realname=realname,
-            comment=comment,
-            admin=False,
-        )
-        return result
+        # 检查用户是否存在
+        get_custom_harbor_relation_response = self.get_custom_harbor_relation(tenant_id)
+        if not get_custom_harbor_relation_response:
+            self.add_custom_harbor_relation(tenant_id, username, password)
+            result = self.harbor.create_user(
+                username=username,
+                email=email,
+                password=password,
+                realname=realname,
+                comment=comment,
+                admin=False,
+            )
+            return result
+        else:
+            return self.return_response(False, 409, f"用户已存在: {username}")
 
     # 添加自定义镜像仓库
     def add_custom_projects(
-        self, project_name: str, public: str, storage_limit: int, user_name: str
+        self, project_name: str, public: str, storage_limit: int, tenant_id: str
     ) -> dict:
         """
         添加自定义镜像仓库项目并分配用户权限
@@ -471,6 +692,23 @@ class HarborService:
             - 如果项目名称已存在，操作将失败
             - 建议在生产环境中使用有意义的项目名称
         """
+        # 检查租户ID是否存在
+        get_custom_harbor_relation_response = self.get_custom_harbor_relation(tenant_id)
+
+        if not get_custom_harbor_relation_response:
+            return self.return_response(False, 400, "租户ID不存在")
+        user_name = get_custom_harbor_relation_response.harbor_name
+
+        # 检查仓库配额限制，是否超出限制100GB
+        all_quota = private_project_storage_limit * 1024 * 1024 * 1024
+        storage_limit = storage_limit * 1024 * 1024 * 1024
+        get_custom_projects_response = self.get_custom_projects(user_name)
+        if not get_custom_projects_response["status"]:
+            return get_custom_projects_response
+        total_hard = sum(project['quota_info']['hard'] for project in get_custom_projects_response["data"])
+        if total_hard + storage_limit > all_quota:
+            return self.return_response(False, 400, "仓库配额超出限制100GB")
+        
         # 创建自定义镜像仓库项目
         add_custom_projects_response = self.harbor.add_custom_projects(
             project_name, public, storage_limit
@@ -495,7 +733,7 @@ class HarborService:
 
     # 更新自定义镜像仓库
     def update_custom_projects(
-        self, project_name: str, public: str, storage_limit: int
+        self, project_name: str, public: str, storage_limit: int, tenant_id: str
     ) -> dict:
         """
         更新自定义镜像仓库项目的配置信息
@@ -519,6 +757,11 @@ class HarborService:
                 - 范围：通常为1-1000 GB
                 - 必须大于当前已使用的存储空间
                 - 示例：50 表示50GB存储限制
+            
+            user_name (str): 要更新项目的用户名
+                - 必须是Harbor中已存在的用户名
+                - 用户名区分大小写
+                - 示例：'developer001', 'user_rkvu5rmv'
 
         Returns:
             dict: 包含更新结果的字典
@@ -535,7 +778,8 @@ class HarborService:
             result = harbor_service.update_custom_projects(
                 project_name="my-project",
                 public="false",
-                storage_limit=50
+                storage_limit=50,
+                user_name="developer001"
             )
 
             if result["status"]:
@@ -549,37 +793,61 @@ class HarborService:
             - 建议在更新前检查当前存储使用情况
             - 存储限制不能小于已使用的存储空间
         """
-        # 更新项目公开性设置
-        update_custom_projects_response = self.harbor.update_custom_projects(
-            project_name, public
-        )
+        # 检查租户ID是否存在
+        get_custom_harbor_relation_response = self.get_custom_harbor_relation(tenant_id)
 
-        if update_custom_projects_response["status"]:
-            # 仓库大小无法使用该接口更改，通过单独调用update_project_quotas接口更改
-            quotas = self.harbor.get_all_quotas()
-            for quota in quotas["data"]:
-                if quota["ref"].get("name") == project_name:
-                    quota_id = quota["id"]
-                    update_project_quotas_response = self.harbor.update_project_quotas(
-                        quota_id, storage_limit
-                    )
-                    if update_project_quotas_response["status"]:
-                        update_custom_projects_response["message"] = (
-                            f"项目 {project_name} 更新成功"
-                        )
-                        return update_custom_projects_response
-                    else:
-                        update_custom_projects_response["message"] = (
-                            f"项目 {project_name} 更新失败"
-                        )
-                        return update_custom_projects_response
-        else:
-            return update_custom_projects_response
+        if not get_custom_harbor_relation_response:
+            return self.return_response(False, 400, "租户ID不存在")
+        user_name = get_custom_harbor_relation_response.harbor_name
+
+        # 检查仓库配额限制，是否超出限制100GB
+        all_quota = private_project_storage_limit * 1024 * 1024 * 1024
+        get_custom_projects_response = self.get_custom_projects(user_name)
+        total_hard = 0
+        project_name_list = []
+        old_public_status = ''
+        old_storage_limit = 0
+        project_id = ''
+        for i in get_custom_projects_response["data"]:
+            if i['name'] == project_name:
+                total_hard += storage_limit * 1024 * 1024 * 1024
+                old_public_status = i['public']
+                old_storage_limit = i['quota_info']['hard']
+                project_id = i['project_id']
+            else:
+                total_hard += i['quota_info']['hard']
+            project_name_list.append(i['name'])
+        if project_name not in project_name_list:
+            return self.return_response(False, 400, f"仓库不存在: {project_name}")
+        if total_hard > all_quota:
+            return self.return_response(False, 400, f"仓库配额超出限制100GB: {project_name}")
+
+        if old_public_status != public:
+            # 更新项目公开性设置
+            update_custom_projects_response = self.harbor.update_custom_projects(
+                project_name, public
+            )
+            if not update_custom_projects_response["status"]:
+                return update_custom_projects_response
+        if old_storage_limit != storage_limit * 1024 * 1024 * 1024:
+            # 更新项目存储限制, 仓库大小无法使用该接口更改，通过单独调用update_project_quotas接口更改
+            get_project_quotas_response = self.harbor.get_project_quotas(project_id)
+            if get_project_quotas_response["status"]:
+                quota_id = get_project_quotas_response["data"][0]["id"]
+                update_project_quotas_response = self.harbor.update_project_quotas(
+                    quota_id, storage_limit
+                )
+                if not update_project_quotas_response["status"]:
+                    return update_project_quotas_response
+            else:
+                return get_project_quotas_response
+
+        return self.return_response(True, 200, "仓库更新成功", '')
 
     # 获取自定义镜像仓库
     # Harbor 的 GET /projects?owner=username 参数并不是用来查询"某个用户参与的项目"，而是用来查询"某个用户创建的项目"。
     # 但是在实际使用中，大多数用户不是用 UI 创建项目，而是管理员创建后把用户加入为成员。此时，用户不是项目 owner，只是成员，所以这个 API 返回为空
-    def get_custom_projects(self, user_name: str) -> dict:
+    def get_custom_projects(self, user_name: str, tenant_id: str = None) -> dict:
         """
         获取指定用户参与的所有自定义镜像仓库项目信息
 
@@ -641,57 +909,48 @@ class HarborService:
             True, 200, "获取自定义镜像仓库成功", ""
         )
         custom_projects_list = []
-
-        # 获取自定义仓库配额信息
-        get_all_quotas_response = self.harbor.get_all_quotas()
+        if tenant_id:
+            get_custom_harbor_relation_response = self.get_custom_harbor_relation(tenant_id)
+            if not get_custom_harbor_relation_response:
+                return self.return_response(False, 400, "租户ID不存在")
+            else:
+                user_name = get_custom_harbor_relation_response.harbor_name
+        else:
+            user_name = user_name
 
         # 获取所有项目，判断用户是否为项目成员
         get_projects_response = self.harbor.get_projects()
         if get_projects_response["status"]:
             for project in get_projects_response["data"]:
                 project_name = project["name"]
-                # 获取项目成员
+                creation_time = project["creation_time"]
+                repo_count = project["repo_count"]
+                project_id = project["project_id"]
+                public = project['metadata'].get("public")
+                # 过滤特殊项目
+                if 'alayanew' in project_name or 'aladdinedu' in project_name:
+                    continue
                 project_members_response = self.harbor.get_project_members(project_name)
                 if project_members_response["status"]:
                     for member in project_members_response["data"]:
                         if member["entity_name"] == user_name:
-                            # 获取自定义镜像仓库
-                            get_project_info_response = self.harbor.get_project_info(
-                                project_name
-                            )
-
-                            # 获取仓库配额信息
-                            for quota in get_all_quotas_response["data"]:
-                                if quota["ref"].get("name") == project_name:
-                                    quota_id = quota["id"]
-                                    get_project_quotas_response = (
-                                        self.harbor.get_project_quotas(quota_id)
-                                    )
-                                    if get_project_quotas_response["status"]:
-                                        quota_info = get_project_quotas_response["data"]
-                                        hard = quota_info["hard"].get("storage")
-                                        used = quota_info["used"].get("storage")
-                                        temp_dict = {
-                                            "creation_time": get_project_info_response[
-                                                "data"
-                                            ]["creation_time"],
-                                            "name": get_project_info_response["data"][
-                                                "name"
-                                            ],
-                                            "quota_info": (
-                                                dict(
-                                                    hard=hard,
-                                                    used=used,
-                                                )
-                                            ),
-                                            "repo_count": get_project_info_response[
-                                                "data"
-                                            ]["repo_count"],
-                                            "project_id": get_project_info_response[
-                                                "data"
-                                            ]["project_id"],
-                                        }
-                                        custom_projects_list.append(temp_dict)
+                            get_project_summary_response = self.harbor.get_project_summary(project_name)
+                            if get_project_summary_response["status"]:
+                                summary_info = get_project_summary_response["data"]
+                                hard = summary_info["quota"]['hard'].get("storage")
+                                used = summary_info["quota"]['used'].get("storage")
+                                temp_dict = {
+                                    "creation_time": creation_time,
+                                    "name": project_name,
+                                    "quota_info": {
+                                        "hard": hard,
+                                        "used": used,
+                                    },
+                                    "repo_count": repo_count,
+                                    "project_id": project_id,
+                                    "public": public,
+                                }
+                                custom_projects_list.append(temp_dict)
                 else:
                     return project_members_response
         else:
@@ -746,7 +1005,7 @@ class HarborService:
         return delete_custom_projects_response
 
     # 获取指定自定义仓库镜像
-    def get_custom_projects_images(self, project_name: str) -> dict:
+    def get_custom_projects_images(self, project_name: str, page: int = 1, page_size: int = 100) -> dict:
         """
         获取指定自定义仓库项目中的所有镜像信息
 
@@ -794,12 +1053,10 @@ class HarborService:
                 print(f"获取失败: {result['message']}")
 
         Note:
-            - 该方法复用了get_public_base_image的逻辑
-            - 返回的数据结构与get_public_base_image一致
             - 镜像大小会自动格式化为GB或MB单位
             - 如果镜像没有标签，tag_name和tag_push_time将显示为'none'
         """
-        get_custom_projects_images_response = self.get_public_base_image(project_name)
+        get_custom_projects_images_response = self.get_private_base_image(project_name, page=page, page_size=page_size)
         return get_custom_projects_images_response
 
     # 删除指定自定义仓库镜像
@@ -862,3 +1119,125 @@ class HarborService:
             project_name, repository_name
         )
         return delete_project_repository_response
+
+
+    # 删除指定自定义仓库镜像TAG
+    def delete_custom_projects_images_tag(self, project_name: str, repository_name: str,digest: str) -> dict:
+        delete_custom_projects_images_tag_response = self.harbor.delete_custom_projects_images_tag(
+            project_name, repository_name, digest
+        )
+        return delete_custom_projects_images_tag_response
+
+    # 获取项目标签
+    def get_public_projects_labels(self, project_name: str, page: int = 1, page_size: int = 100) -> dict:
+        get_project_info = self.harbor.get_project_info(project_name)
+        if get_project_info["status"]:
+            project_id = get_project_info["data"]["project_id"]
+            get_public_projects_labels_response = self.harbor.get_public_projects_labels(project_id, page, page_size)
+            return get_public_projects_labels_response
+        else:
+            return get_project_info
+
+    # 添加租户与harbor的关联关系
+    def add_custom_harbor_relation(self, tenant_id: str, harbor_name: str, harbor_password: str):
+        """
+        开通自定义镜像仓库
+        该方法会执行以下操作：
+        1. 关联租户与harbor的关系
+        """
+        # 空
+        if not tenant_id or not harbor_name or not harbor_password:
+            return None
+        # 已存在
+        relation = self.get_custom_harbor_relation(tenant_id)
+        if relation:
+            raise Fail("custom harbor service already exists", "租户的私有仓库已存在")
+        # 声明relation对象
+        relation = TenantHarborRelation(
+            id=uuid.uuid4().hex,
+            tenant_id=tenant_id,
+            harbor_name=harbor_name,
+            harbor_password=harbor_password,
+            create_time=datetime.now(),
+        )
+        # 入库
+        HarborRelationSQL.create_harbor_relation(relation)
+
+    # 删除租户与harbor的关联关系
+    def delete_custom_harbor_relation(self, tenant_id: str):
+        """
+        开通自定义镜像仓库
+        该方法会执行以下操作：
+        1. 删除关联租户与harbor的关系
+        """
+        # 空
+        if not tenant_id:
+            raise Fail("param error", "参数错误")
+        # 查库
+        relation = self.get_custom_harbor_relation(tenant_id)
+        # 不存在
+        if not relation:
+            raise Fail("custom harbor service not exists", "租户的私有仓库不存在")
+        # 入库
+        HarborRelationSQL.delete_harbor_relation_by_id(relation.id)
+        # 调用harbor的自定义仓库接口？？？
+
+    # 查询租户与harbor的关联关系
+    def get_custom_harbor_relation(self, tenant_id: str):
+        """
+        查询自定义镜像仓库，根据租户的id返回，如果存在返回数据数据，不存在返回None
+        """
+        # 空
+        if not tenant_id:
+            return None
+        # 返回数据
+        return HarborRelationSQL.get_harbor_relation_by_tenant_id(tenant_id=tenant_id)
+
+    # 校验harbor用户名是否存在
+    def check_harbor_user(self, harbor_name: str):
+        """
+        校验harbor用户名是否存在
+        """
+        return HarborRelationSQL.get_harbor_relation_by_tenant_id(username=harbor_name)
+
+    # 修改用户密码
+    def update_user_password(self, username: str, old_password: str, new_password: str):
+        """
+        修改用户密码
+        """
+        get_user_id_response = self.harbor.get_user_id(username=username)
+
+        if get_user_id_response["status"]:
+            if len(get_user_id_response["data"]) == 0:
+                return {
+                    "status": False,
+                    "code": 400,
+                    "message": "用户不存在",
+                    "data": None,
+                }
+            else:
+                user_id = get_user_id_response["data"][0]["user_id"]
+                update_user_password_response = self.harbor.update_user_password(user_id=user_id, old_password=old_password, new_password=new_password)
+                if update_user_password_response["status"]:
+                    # 根据用户名获取harbor_relation记录
+                    harbor_relation = HarborRelationSQL.get_harbor_relation_by_tenant_id(username=username)
+                    if harbor_relation:
+                        # 根据ID更新harbor_relation表的密码
+                        HarborRelationSQL.update_harbor_relation(id=harbor_relation.id, harbor_password=new_password)
+                        return {
+                            "status": True,
+                            "code": 200,
+                            "message": "修改用户密码成功",
+                            "data": None,
+                        }
+                    else:
+                        return {
+                            "status": False,
+                            "code": 400,
+                            "message": "未找到对应的harbor关联记录",
+                            "data": None,
+                        }
+                else:
+                    return update_user_password_response
+        else:
+            return get_user_id_response

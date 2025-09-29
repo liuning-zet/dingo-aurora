@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 
 from dingo_command.utils.neutron import API as neutron
 from dingo_command.common.cinder_client import CinderClient
+from dingo_command.common.keystone_client import KeystoneClient
 from dingo_command.common.network import init_cluster_network
 from dingo_command.services import CONF
 
@@ -13,10 +14,30 @@ class TestNeutron(unittest.TestCase):
         测试 init_cluster_network 方法
         """
         # 假设有一个测试 project_id
-        test_project_id = "2ef792461415449796e25ab9c438ca6f"
+        test_project_id = "9caa8f93152f46e6bae66c9b25f0f74f"
         try:
-            init_cluster_network(test_project_id, "7a9b1050-b638-4273-9e9d-e42ef14c1b52")
+            init_cluster_network(test_project_id, "0e724c10-8575-4bf4-a8b2-b333c4f14fd1")
             print("init_cluster_network 测试通过")
+        except Exception as e:
+            print(f"init_cluster_network 测试失败: {e}")
+
+    def test_app_credentials(self):
+        """
+        测试 app_credentials 方法
+        """
+        # 假设有一个测试 project_id
+        user_id = "ef81a343e6ce472e8d81a71954ed047a"
+        name = "bbb"
+        #token = "gAAAAABoylZjYufJCrtzX1eefvOjMdebajWzFpaunpb82uPGC99WiuW75VD5F0hYVs5FEaF35pOSPknQC5G6rdBNukpi1T4EfRUZIfrrLjs0TFgDna7omF_dFEWYeyIbfnYC-CB-uKv1JfCm9J_DGfMxWdce84VCh7UWF7rodgQ_Rbn0nkhvqaxfimtsa_T701We1JwRa1YX"
+        try:
+            keystoneclient = KeystoneClient(token=token)
+            app_credential = keystoneclient.get_app_credential(user_id=user_id, name=name)
+            if not app_credential:
+                app_credential = keystoneclient.create_app_credential(user_id=user_id, name=name)
+            name = app_credential.name
+            id = app_credential.id  
+            secret= app_credential.secret
+           
         except Exception as e:
             print(f"init_cluster_network 测试失败: {e}")
 

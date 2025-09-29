@@ -1,13 +1,14 @@
+import re
 import time
 from typing import Union
-import asyncio
+
 from datetime import datetime
 import json
 from fastapi import Query
 from fastapi import APIRouter, HTTPException, BackgroundTasks
-from dingo_command.api.model.chart import CreateRepoObject, CreateAppObject
+from dingo_command.api.model.chart import CreateRepoObject, CreateAppObject, ListChartInfoObject, ChartInfoObject
 from dingo_command.services.chart import ChartService, create_harbor_repo, create_tag_info
-from dingo_command.db.models.chart.sql import RepoSQL
+from dingo_command.db.models.chart.sql import RepoSQL, AppSQL
 from dingo_command.utils.helm.util import ChartLOG as Log
 from dingo_command.utils.helm.redis_lock import RedisSentinelDistributedLock
 from dingo_command.celery_api import CONF
@@ -36,20 +37,22 @@ async def init():
             time.sleep(3)
     except Exception as e:
         if "acquire lock" not in str(e):
-            Log.error(f"执行过程中发生错误: {e}")
+            Log.error("An error occurred during execution: time out")
             import traceback
             traceback.print_exc()
             raise e
 
+# TODO: comment here by ketor, need to test if async works well
+# asyncio.run(init())
 
-asyncio.run(init())
 
 @router.post("/repo", summary="helm的repo仓库（异步）", description="创建helm的repo仓库（异步）")
 async def create_repo(repo: CreateRepoObject, background_tasks: BackgroundTasks):
     try:
         # 1、判断参数是否合法
+        repo.url = repo.url.strip()
         await chart_service.check_repo_args(repo)
-        Log.info("add repo, repo info %s" % repo)
+        Log.info("add repo, repo info %s", str(repo))
         # 2、异步处理创建repo仓库的逻辑
         background_tasks.add_task(chart_service.create_repo, repo, update=False, status="creating")
         return {"success": True, "message": "create repo started, please wait"}
@@ -66,6 +69,7 @@ async def list_repos(background_tasks: BackgroundTasks, cluster_id: str = Query(
                      name: str = Query(None, description="名称"),
                      is_global: bool = Query(None, description="名称"),
                      id: str = Query(None, description="id"),
+                     type: str = Query(None, description="类型"),
                      page: int = Query(1, description="页码"),
                      page_size: int = Query(10, description="页数量大小"),
                      sort_dirs:str = Query(None, description="排序方式"),
@@ -80,6 +84,8 @@ async def list_repos(background_tasks: BackgroundTasks, cluster_id: str = Query(
             query_params['is_global'] = is_global
         if id:
             query_params['id'] = id
+        if type:
+            query_params['type'] = type
         if status:
             query_params['status'] = status
         if cluster_id:
@@ -128,7 +134,7 @@ async def update_repo(repo_id: Union[str, int], repo_data: CreateRepoObject, bac
     try:
         # 更新repo仓库的配置
         # 先从数据库中看看有没有repo_id这个数据，如果没有直接返回404
-        Log.info("update repo, repo id %s" % repo_id)
+        Log.info("update repo, repo id %s", str(repo_id))
         query_params = {}
         query_params["id"] = repo_id
         data = chart_service.list_repos(query_params, 1, -1, None, None)
@@ -247,6 +253,8 @@ async def sync_repo(repo_id: Union[str, int], background_tasks: BackgroundTasks)
             raise ValueError("repo is updating, please wait")
         if repo_data.status == util.repo_status_sync:
             raise ValueError("repo is syncing, please wait")
+        if repo_data.status == util.repo_status_stop:
+            raise ValueError("repo is unavailable, only available repo can be sync")
         data = chart_service.get_repo_from_name(repo_id)
         if data.get("data"):
             chart_service.delete_charts_repo_id(data.get("data"))
@@ -366,6 +374,48 @@ async def get_repo_charts(cluster_id: str = Query(None, description="集群id"),
         if id:
             query_params['id'] = id
         # 显示repo列表的逻辑
+        # 如果是repo==1，并且chart_name在必须安装组件的列表中
+        if repo_id == 1 or repo_id == "1":
+            data = chart_service.list_charts(query_params, page, page_size, sort_keys, sort_dirs)
+            chart_tmp_list = []
+            for chart in data.get("data"):
+                chart_info= ChartInfoObject(
+                    id=chart.id,
+                    name=chart.name,
+                    prefix_name=chart.prefix_name,
+                    cluster_id=chart.cluster_id,
+                    repo_id=chart.repo_id,
+                    icon=chart.icon,
+                    description=chart.description,
+                    repo_name=chart.repo_name,
+                    type=chart.type,
+                    tag_id=chart.tag_id,
+                    tag_name=chart.tag_name,
+                    status=chart.status,
+                    create_time=chart.create_time,
+                    version=chart.version,
+                    latest_version=chart.latest_version,
+                    deprecated=chart.deprecated,
+                    chart_content=chart.chart_content,
+                    values_content=chart.values_content,
+                    readme_content=chart.readme_content,
+                    extra=chart.extra,
+                    need_install= True if chart.name in util.need_install_chart else False
+                )
+                chart_tmp_list.append(chart_info)
+            chart_tmp_list_sorted = sorted(
+                chart_tmp_list,
+                key=lambda chart: chart.need_install,
+                reverse=True
+            )
+            data = ListChartInfoObject(
+                total=data.get("total"),
+                data=chart_tmp_list_sorted,
+                currentPage=data.get("currentPage"),
+                pageSize=data.get("pageSize"),
+                totalPages=data.get("totalPages")
+            )
+            return data
         return chart_service.list_charts(query_params, page, page_size, sort_keys, sort_dirs)
     except Exception as e:
         import traceback
@@ -491,7 +541,7 @@ async def put_app(app_id: Union[str, int], update_data: CreateAppObject, backgro
     try:
         # 编辑或更新已安装应用
         # 获取app的id，然后添加到update_data
-        Log.info(f"update app, app_id %s" % app_id)
+        Log.info(f"update app, app_id %s", str(app_id))
         query_params = {}
         query_params["id"] = app_id
         data = chart_service.list_apps(query_params, 1, -1, None, None)
@@ -505,6 +555,25 @@ async def put_app(app_id: Union[str, int], update_data: CreateAppObject, backgro
             raise ValueError("app is updating, please wait")
         if app_data.status == util.app_status_delete:
             raise ValueError("app is deleting, please wait")
+
+        # 如果发现repo正在更新或者正在同步，就不能编辑app
+        repo_id = app_data.repo_id
+        query_params = {}
+        query_params["id"] = repo_id
+        data = chart_service.list_repos(query_params, 1, -1, None, None)
+        if data.get("total") == 0:
+            raise ValueError("repo not found")
+        repo_data = data.get("data")[0]
+        if repo_data.status == util.repo_status_failed:
+            raise ValueError("repo is unavailable, please check")
+        if repo_data.status == util.repo_status_sync:
+            raise ValueError("repo is syncing, please wait")
+        if repo_data.status == util.repo_status_update:
+            raise ValueError("repo is updating, please wait")
+        if repo_data.status == util.repo_status_delete:
+            raise ValueError("repo is deleting, can't edit app")
+        chart_service.get_chart_version_info(app_data.chart_id)
+
         update_data.id = app_data.id
         update_data.name = app_data.name
         update_data.cluster_id = app_data.cluster_id
@@ -540,10 +609,10 @@ async def get_chart_version(chart_id: Union[str, int], version: str = Query(None
         raise HTTPException(status_code=400, detail=f"get chart detail with version error: {str(e)}")
 
 @router.delete("/app/{app_id}", summary="删除某个已安装的应用（异步）", description="删除某个已安装的应用（异步）")
-async def get_apps(app_id: Union[str, int], background_tasks: BackgroundTasks):
+async def delete_apps(app_id: Union[str, int], background_tasks: BackgroundTasks):
     try:
         # 删除某个已安装的应用
-        Log.info("delete app, app_id %s" % app_id)
+        Log.info("delete app, app_id %s ", str(app_id))
         query_params = {}
         query_params["id"] = app_id
         data = chart_service.list_apps(query_params, 1, -1, None, None)
@@ -557,6 +626,9 @@ async def get_apps(app_id: Union[str, int], background_tasks: BackgroundTasks):
             raise ValueError("app is updating, please wait")
         if app_data.status == util.app_status_delete:
             raise ValueError("app is deleting, please wait")
+        if app_data.status == util.app_status_failed and "cannot re-use a name" in app_data.status_msg :
+            AppSQL.delete_app(app_data)
+            return {"success": True, "message": "delete app success"}
         background_tasks.add_task(chart_service.delete_app, app_data)
         return {"success": True, "message": "delete app started, please wait"}
     except Exception as e:
@@ -567,11 +639,17 @@ async def get_apps(app_id: Union[str, int], background_tasks: BackgroundTasks):
 
 
 @router.post("/charts/install", summary="安装某个应用（异步）", description="安装某个应用（异步）")
-async def get_apps(create_data: CreateAppObject, background_tasks: BackgroundTasks):
+async def post_apps(create_data: CreateAppObject, background_tasks: BackgroundTasks):
     try:
-        Log.info(f"install app {create_data.name}, data info {create_data}")
+        Log.info("install app %s", create_data.name)
         if not create_data.namespace:
             create_data.namespace = "default"
+        # 在这里添加对于app的name做校验，让它符合helm安装name的规则
+        pattern = re.compile(r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$')
+        if not bool(pattern.fullmatch(create_data.name)) or len(create_data.name) > 53:
+            raise ValueError("invalid release name, must match regex "
+                             "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ "
+                             "and the length must not be longer than 53")
         query_params = {}
         query_params["cluster_id"] = create_data.cluster_id
         data = chart_service.list_apps(query_params, 1, -1, None, None)
@@ -585,15 +663,5 @@ async def get_apps(create_data: CreateAppObject, background_tasks: BackgroundTas
     except Exception as e:
         import traceback
         traceback.print_exc()
-        Log.error(f"install app {create_data.name} failed, reason: {str(e)}")
+        Log.error("install app %s failed, reason: %s", create_data.name, str(e))
         raise HTTPException(status_code=400, detail=f"install app error: {str(e)}")
-
-
-@router.get("/helm/list", summary="安装某个应用（异步）", description="安装某个应用（异步）")
-async def get_test(kube_config_path: str = Query(None, description="kube_config路径")):
-    try:
-        content = chart_service.get_helm_list(kube_config_path)
-        content_list = json.loads(content)
-        return {"data": content_list}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"helm list error: {str(e)}")

@@ -12,6 +12,7 @@ from dingo_command.db.models.chart.sql import AppSQL, RepoSQL, ChartSQL
 from dingo_command.db.models.cluster.sql import ClusterSQL
 from dingo_command.services.chart import ChartService
 from dingo_command.api.model.chart import CreateRepoObject, CreateAppObject
+from dingo_command.api.chart import init
 from dingo_command.utils.helm import util
 from dingo_command.celery_api import CONF
 from dingo_command.utils.helm.redis_lock import RedisSentinelDistributedLock
@@ -31,13 +32,15 @@ master_name = "kolla"
 
 def start():
     # 添加检查集群状态的定时任务，每180秒执行一次
-    scheduler.add_job(run_once, 'interval', seconds=180, args=[check_app_status], next_run_time=datetime.now())
+    scheduler.add_job(run_once, 'interval', seconds=180, args=[check_app_status], next_run_time=datetime.now(),
+                      max_instances=1)
     scheduler.add_job(run_once, 'interval', seconds=180, args=[remove_global_chart],
-                      next_run_time=datetime.now())
+                      next_run_time=datetime.now(), max_instances=1)
     scheduler.add_job(run_once, 'interval', args=[check_cluster_status], seconds=1800,
-                      next_run_time=datetime.now())
+                      next_run_time=datetime.now(), max_instances=1)
     scheduler.start()
-    scheduler_async.add_job(start_async,'cron', hour=0, minute=0, args=[check_sync_status])
+    scheduler_async.add_job(start_async,'cron', hour=0, minute=0, args=[check_sync_status], max_instances=1)
+    scheduler_async.add_job(start_async, 'date', args=[init], run_date=datetime.now(), max_instances=1)
     scheduler_async.start()
 
 async def start_async(func):
@@ -77,14 +80,12 @@ def check_app_status():
     try:
         LOG.info(f"Starting check app status at {time.strftime('%Y-%m-%d %H:%M:%S')}")
         os.makedirs(config_dir, exist_ok=True)
-        # 先获取所有repo的cluster_id
+        # 先获取所有app的cluster_id
         query_params = {}
-        count, repos = RepoSQL.list_repos(query_params, page_size=-1)
+        count, apps = AppSQL.list_apps(query_params, page_size=-1)
         cluster_id_list = []
-        for repo in repos:
-            if repo.is_global:
-                continue
-            cluster_id = repo.cluster_id
+        for app in apps:
+            cluster_id = app.cluster_id
             if cluster_id not in cluster_id_list:
                 query_params = {}
                 query_params["id"] = cluster_id
@@ -106,7 +107,11 @@ def check_app_status():
             count, clusters = ClusterSQL.list_cluster(query_params, 1, -1, sort_keys=None, sort_dirs=None)
             if count < 1:
                 continue
+            if clusters[0].status != "running":
+                continue
             # 1、先获取cluster_id，然后获取kube_config文件
+            netns = "qdhcp-" + str(clusters[0].admin_network_id)
+            # set_netns(netns)
             kube_config = json.loads(clusters[0].kube_info).get("kube_config")
             if not kube_config:
                 continue
@@ -115,8 +120,29 @@ def check_app_status():
                 f.write(kube_config)
 
             # 2、拿到kube_config文件后，通过helm list获取真实存在的app的名称
-            content = chart_service.get_helm_list(config_file)
+            content = chart_service.get_helm_list(config_file, netns)
             content_list = json.loads(content)
+            # 处理app状态为creating、updating、deleting的情况
+            for app in apps:
+                if ((app.status == util.app_status_create or app.status == util.app_status_update) and
+                        (datetime.now() - app.update_time).total_seconds() > 600):
+                    # 重新安装app
+                    create_data = CreateAppObject(
+                        id=str(app.id),
+                        name=app.name,
+                        namespace=app.namespace,
+                        chart_id=str(app.chart_id),
+                        cluster_id=app.cluster_id,
+                        values=json.loads(app.values),
+                        chart_version=app.version,
+                        description=app.description
+                    )
+                    chart_service.install_app(create_data, update=True)
+                elif app.status == util.app_status_delete and (datetime.now() - app.update_time).total_seconds() > 600:
+                    # 删除app
+                    chart_service.delete_app(app)
+
+            # 处理app状态为running的情况
             for app in apps:
                 if app.status != util.app_status_success:
                     continue
@@ -145,6 +171,8 @@ def check_app_status():
         shutil.rmtree(config_dir)
         LOG.info(f"Finished check app status at {time.strftime('%Y-%m-%d %H:%M:%S')}")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         LOG.error(f"Error in app_status: {str(e)}")
 
 

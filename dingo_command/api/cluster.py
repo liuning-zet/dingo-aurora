@@ -1,5 +1,8 @@
 import os
 import tempfile
+import traceback
+import paramiko
+import socket
 from typing import List
 from fastapi import Query
 from fastapi.responses import FileResponse
@@ -36,11 +39,12 @@ async def create_cluster(cluster_object:ClusterObject, token: str = Depends(get_
         #SystemService.create_system_log(OperateLogApiModel(operate_type="create", resource_type="flow", resource_id=cluster_id, resource_name=cluster_object.name, operate_flag=True))
         return cluster_id
     except Fail as e:
+        traceback.print_exc()
         raise HTTPException(status_code=400, detail=e.error_message)
     except  HTTPException as e:
+        traceback.print_exc()
         raise HTTPException(status_code=e.status_code, detail=e.detail)
     except Exception as e:
-        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(e))
     
@@ -99,7 +103,6 @@ async def get_cluster_private_key(cluster_id:str = Query(None, description="集�
             #background=BackgroundTasks([lambda: os.unlink(temp_path)])  # 请求完成后删除临时文件
         )
     except Exception as e:
-        import traceback
         traceback.print_exc()
         raise e
 
@@ -114,7 +117,6 @@ async def get_cluster_progress(type:str):
     except Fail as e:
         raise HTTPException(status_code=400, detail=e.error_message)
     except Exception as e:
-        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=400, detail="get cluster progress param error")
 
@@ -129,7 +131,6 @@ async def get_cluster_progress(cluster_id:str):
     except Fail as e:
         raise HTTPException(status_code=400, detail=e.error_message)
     except Exception as e:
-        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=f"get cluster progress error {str(e)}")
 
@@ -144,7 +145,6 @@ async def get_cluster_progress(cluster_id:str):
     except Fail as e:
         raise HTTPException(status_code=400, detail=e.error_message)
     except Exception as e:
-        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=f"get delete cluster progress error {str(e)}")
     
@@ -159,7 +159,6 @@ async def list_params():
     except Fail as e:
         raise HTTPException(status_code=400, detail=e.error_message)
     except Exception as e:
-        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=400, detail="get cluster param error")
     
@@ -174,7 +173,6 @@ async def get_cluster(cluster_id:str):
     except Fail as e:
         raise HTTPException(status_code=400, detail=e.error_message)
     except Exception as e:
-        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=f"get cluster error {str(e)}")
 
@@ -203,7 +201,6 @@ async def delete_cluster(cluster_id:str, token: str = Depends(get_token)):
     except  HTTPException as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
     except Exception as e:
-        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=f"delete cluster error {str(e)}")
     
@@ -237,11 +234,45 @@ async def add_node(cluster_id:str, servers: List[ExistingNodeObject], token: str
                     raise HTTPException(status_code=400, detail=f"Server {server.id} not found")
                 if not server_detail.get("addresses"):
                     raise HTTPException(status_code=400, detail=f"Server {server.id} has no networks")
-                # 检查网络是否匹配
-                # 获取第一个网络的地址信息
-                first_network = list(server_detail["addresses"].keys())
-                if not any(net == result.network_config.admin_network_name for net in first_network):
-                    raise HTTPException(status_code=400, detail=f"Server {server.id} network does not match the cluster network")
+                network_addresses = server_detail["addresses"][result.network_config.admin_network_name]
+                if not network_addresses:
+                    raise HTTPException(status_code=400, detail=f"Server {server.id} has no IP in the matching network")
+                node_ip = network_addresses[0]["addr"]  # 假设 IP 在 "addr" 字段
+
+                interfaces = nova_client.nova_server_interfaces_list(server.id)
+                if not interfaces or len(interfaces) == 0:
+                    raise HTTPException(status_code=400, detail=f"Server {server.id} has no network interfaces")
+                network_id = interfaces[0]['net_id']
+                netns  = "qdhcp-" + str(network_id)
+                # 测试 SSH 连通性
+                import subprocess
+                cmd = []
+                if server.private_key and server.private_key != "":
+                    # 使用私钥
+                    cmd = [
+                        "ssh",
+                        "-i", server.private_key,
+                        "-o", "StrictHostKeyChecking=no",
+                        "-o", "ConnectTimeout=10",
+                        f"{server.user}@{node_ip}",
+                        "echo 'SSH connection successful'"
+                    ]
+                    
+                else:
+                    # 使用密码（需要安装 sshpass）
+                    cmd = [
+                        "sshpass", "-p", server.password,
+                        "ssh",
+                        "-o", "StrictHostKeyChecking=no",
+                        "-o", "ConnectTimeout=10",
+                        f"{server.user}@{node_ip}",
+                        "echo 'SSH connection successful'"
+                    ]
+                if netns and netns != "":
+                    cmd = ["ip", "netns", "exec", netns] + cmd
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                if result.returncode != 0:
+                    raise Exception(f"SSH connection failed: {result.stderr}")
                 server_details.append(server_detail)
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Failed to get server {server.id} details: {str(e)}")
@@ -256,6 +287,5 @@ async def add_node(cluster_id:str, servers: List[ExistingNodeObject], token: str
     except  HTTPException as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
     except Exception as e:
-        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=f"add node error {str(e)}")
