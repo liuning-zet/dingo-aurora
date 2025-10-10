@@ -1166,7 +1166,6 @@ def remove_bastion_fip_from_state(cluster_dir):
             
             print(f"rm bastion_fip from terraform state ")
             return True
-
         elif "module.network.openstack_networking_router_v2.cluster[0]" in state_resources:
             # 执行 terraform state rm 移除资源
             remove_result = subprocess.run(
@@ -1187,6 +1186,17 @@ def remove_bastion_fip_from_state(cluster_dir):
                 check=True
             )
             print(f"rm cluster_interface from terraform state ")
+            return True
+        elif "module.network.openstack_networking_router_interface_v2.cluster_interface_n[0]" in state_resources:
+            # 执行 terraform state rm 移除资源
+            remove_result = subprocess.run(
+                ["terraform", "state", "rm",
+                 "module.network.openstack_networking_router_interface_v2.cluster_interface_n[0]"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            print(f"rm cluster_interface_n from terraform state ")
             return True
         else:
             print(f"resource {target_resource} not exist in state ")
@@ -2036,8 +2046,8 @@ def delete_node(self, cluster_id, cluster_name, node_list, instance_list, extrav
 
         # 3、然后需要更新node节点的数据库的信息和集群的数据库信息
         # 更新集群cluster的状态为running，删除缩容节点的数据库信息
-        if cluster_tfvars and hosts_data and master_ip:
-            remove_node_exporter(cluster_tfvars, node_list, hosts_data, master_ip, cluster_dir, netns)
+        # if cluster_tfvars and hosts_data and master_ip:
+        #     remove_node_exporter(cluster_tfvars, node_list, hosts_data, master_ip, cluster_dir, netns)
         component_task.end_time = datetime.fromtimestamp(datetime.now().timestamp())
         component_task.state = "success"
         component_task.detail = TaskService.TaskDetail.remove_file_dirs.value

@@ -72,7 +72,7 @@ class InstanceService:
             resseervers = []
             # 将OpenStack中的服务器与数据库中的实例进行比对
             for server in servers:
-                if server['id'] not in db_server_ids:
+                if server['id'] not in db_server_ids and server['status'] == "ACTIVE":
                     # 如果数据库中不存在该服务器，则可以进行相应处理
                     resseervers.append(server)
             res['data'] = resseervers

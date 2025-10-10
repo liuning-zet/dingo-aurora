@@ -78,10 +78,6 @@
     validate: "{{ bin_dir }}/kubeadm config validate --config %s"
   when: ('kube_control_plane' not in group_names)
 
-- name: Reset kubeadm if kubelet_conf is true
-  shell: kubeadm reset -f
-  when: kubelet_conf | bool
-
 - name: Join to cluster if needed
   environment:
     PATH: "{{ bin_dir }}:{{ ansible_env.PATH }}:/sbin"

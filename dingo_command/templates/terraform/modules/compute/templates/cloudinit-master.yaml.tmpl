@@ -195,4 +195,3 @@ runcmd:
   - sed -i 's/^.*GSSAPIAuthentication.*$/GSSAPIAuthentication no/' /etc/ssh/sshd_config.d/50-redhat.conf || echo "GSSAPIAuthentication no" >> /etc/ssh/sshd_config.d/50-redhat.conf
   - sed -i 's/^.*GSSAPIAuthentication.*$/GSSAPIAuthentication no/' /etc/ssh/sshd_config.d/50-cloud-init.conf || echo "GSSAPIAuthentication no" >> /etc/ssh/sshd_config.d/50-cloud-init.conf
   - /bin/bash /opt/configure_ssh.sh > /opt/ssh_config.log
-  - /bin/bash /opt/install_node_exporter.sh > /opt/install.log
