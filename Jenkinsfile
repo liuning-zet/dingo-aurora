@@ -175,4 +175,35 @@ pipeline {
             }
         }
     }
+
+    post {
+        success {
+            script {
+                echo "Pipeline successful. Triggering downstream test job."
+
+                // 1. 获取 Commit ID
+                def commitId = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+
+                // 2. 获取提交作者的名字 (%an)
+                //    你可以根据需要换成作者邮箱 (%ae)、提交者名字 (%cn) 或提交者邮箱 (%ce)
+                def commitAuthor = sh(returnStdout: true, script: "git log -1 --pretty=format:'%an'").trim()
+
+                // 3. 触发下游项目，并传递三个参数
+                build(
+                    job: 'your-automation-test-project-name', // <== 把这里替换成你的自动化测试项目的名字
+                    wait: false,
+                    parameters: [
+                        string(name: 'GIT_BRANCH', value: env.BRANCH_NAME),
+                        string(name: 'GIT_COMMIT_ID', value: commitId),
+                        string(name: 'GIT_COMMIT_USER', value: commitAuthor) // <-- 新增的参数
+                    ]
+                )
+            }
+        }
+        failure {
+            echo "Pipeline failed."
+        }
+    }
+
+
 }
