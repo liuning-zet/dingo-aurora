@@ -1293,7 +1293,7 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
         host_file = os.path.join(WORK_DIR, "ansible-deploy", "inventory", cluster_tf_dict["id"], "hosts")
         os.chmod(host_file, 0o755)  # rwxr-xr-x permission
         master_ip, lb_ip, hosts_data = get_ips(cluster_tfvars, task_info, host_file, cluster_dir)
-        network_id = hosts_data["_meta"]["hostvars"][f"{cluster_tfvars.cluster_name}-master-1"]["network"][0]['uuid']
+        network_id, _, _, _, _, _ = get_networks(cluster_tfvars, task_info, host_file, cluster_dir)
         netns = "qdhcp-" + network_id
         # ensure /root/.ssh/known_hosts exists
         if os.path.exists("/root/.ssh/known_hosts"):
@@ -1552,11 +1552,13 @@ def get_ips(cluster_tfvars, task_info, host_file, cluster_dir):
     hosts = res.stdout
     hosts_data = json.loads(hosts)
 
-    # 如果是 hosted_k8s 类型，返回空值
-    if  cluster_tfvars.number_of_k8s_masters == 0:
-        return "", "", hosts_data
     # 从_meta.hostvars中获取master节点的IP
     master_node_name = cluster_tfvars.cluster_name + "-master-1"
+
+    # 检查master节点是否存在
+    if master_node_name not in hosts_data["_meta"]["hostvars"]:
+        return "", "", hosts_data
+
     master_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
     lb_ip = hosts_data["_meta"]["hostvars"][master_node_name]["lb_ip"]
     return master_ip, lb_ip, hosts_data
@@ -1573,11 +1575,18 @@ def get_networks(cluster_tfvars, task_info, host_file, cluster_dir):
         raise Exception("Error generating Ansible inventory")
     hosts = res.stdout
     hosts_data = json.loads(hosts)
-    # 从_meta.hostvars中获取master节点的IP
-    node_name = cluster_tfvars.cluster_name + "-master-1"
-    # if cluster_tfvars.number_of_k8s_masters == 0:
-    #     node_name = cluster_tfvars.cluster_name + "-node-1"
-    
+
+    # 检查master节点是否存在，如果存在就使用master，否则使用第一个node
+    master_node_name = cluster_tfvars.cluster_name + "-master-1"
+    if master_node_name in hosts_data["_meta"]["hostvars"]:
+        node_name = master_node_name
+    else:
+        # 从node节点中选择第一个
+        node_nodes = [node for node in hosts_data["_meta"]["hostvars"].keys() if node.startswith(f"{cluster_tfvars.cluster_name}-node-")]
+        if not node_nodes:
+            raise Exception("No nodes found in inventory")
+        node_name = node_nodes[0]
+
     bus_network_id = ""
     bus_network_name = ""
     network_id = hosts_data["_meta"]["hostvars"][node_name]["network"][0]['uuid']
@@ -1853,8 +1862,17 @@ def delete_cluster(self, cluster_id, token):
 
 
 def remove_node_exporter(cluster_tfvars, node_list, hosts_data, master_ip, cluster_dir, netns):
+    # 检查master节点是否存在，如果存在就使用master，否则使用第一个node
     master_node_name = f"{cluster_tfvars.cluster_name}-master-1"
-    ssh_port = hosts_data["_meta"]["hostvars"][master_node_name].get("ansible_port", 22)
+    if master_node_name in hosts_data["_meta"]["hostvars"]:
+        ssh_port = hosts_data["_meta"]["hostvars"][master_node_name].get("ansible_port", 22)
+    else:
+        # 从node节点中选择第一个
+        node_nodes = [node for node in hosts_data["_meta"]["hostvars"].keys() if node.startswith(f"{cluster_tfvars.cluster_name}-node-")]
+        if node_nodes:
+            ssh_port = hosts_data["_meta"]["hostvars"][node_nodes[0]].get("ansible_port", 22)
+        else:
+            ssh_port = 22  # 默认端口
     for node in node_list:
         if cluster_tfvars.password:
             cmd = (f'sshpass -p "{cluster_tfvars.password}" ssh -o StrictHostKeyChecking=no -o "ProxyCommand=sshpass '
@@ -1965,7 +1983,8 @@ def delete_node(self, cluster_id, cluster_name, node_list, instance_list, extrav
             cluster_tfvars.ssh_user = content.get("ssh_user")
             cluster_tfvars.password = content.get("password")
             master_ip, lb_ip, hosts_data = get_ips(cluster_tfvars, task_info, host_file, cluster_dir)
-            network_id = hosts_data["_meta"]["hostvars"][f"{cluster_name}-master-1"]["network"][0]['uuid']
+            network_id, _, _, _, _, _ = get_networks(cluster_tfvars, task_info, host_file, cluster_dir)
+            # network_id = hosts_data["_meta"]["hostvars"][f"{cluster_name}-master-1"]["network"][0]['uuid']
             netns = "qdhcp-" + network_id
             # ensure /root/.ssh/known_hosts exists
             if os.path.exists("/root/.ssh/known_hosts"):
@@ -2761,7 +2780,7 @@ def generate_tenant_control_plane_yaml(cluster: ClusterObject, cluster_tfvars: C
             "dataStore": "default",
             "controlPlane": {
                 "deployment": {
-                    "replicas": cluster.kube_info.number_master,
+                    "replicas": cluster.kube_info.number_master if cluster.kube_info.number_master > 0 else 1,
                     "registrySettings": {
                         "registry": "registry.cn-hangzhou.aliyuncs.com/google_containers"
                     },

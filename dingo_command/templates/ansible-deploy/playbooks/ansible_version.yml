@@ -25,7 +25,7 @@
       tags:
         - check
 
-    - name: "Check that jinja is not too old (install via pip)"
+    - name: " (install via pip)"
       assert:
         msg: "Your Jinja version is too old, install via pip"
         that: "{% set test %}It works{% endset %}{{ test == 'It works' }}"

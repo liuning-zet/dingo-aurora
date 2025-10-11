@@ -8,6 +8,7 @@
     src: "{{ external_openstack_cacert }}"
   register: external_openstack_cacert_b64
   when:
+    - not hosted_k8s
     - inventory_hostname == groups['kube_control_plane'][0]
     - external_openstack_cacert is defined
     - external_openstack_cacert | length > 0
@@ -16,7 +17,9 @@
 - name: External OpenStack Cloud Controller | Get base64 cloud-config
   set_fact:
     external_openstack_cloud_config_secret: "{{ lookup('template', 'external-openstack-cloud-config.j2') | b64encode }}"
-  when: inventory_hostname == groups['kube_control_plane'][0]
+  when:
+    - not hosted_k8s
+    - inventory_hostname == groups['kube_control_plane'][0]
   tags: external-openstack-secret
 
 - name: External OpenStack Cloud Controller | Generate Manifests
@@ -32,7 +35,9 @@
     # - {name: external-openstack-cloud-controller-manager-role-bindings, file: external-openstack-cloud-controller-manager-role-bindings.yml}
     # - {name: external-openstack-cloud-controller-manager-ds, file: external-openstack-cloud-controller-manager-ds.yml}
   register: external_openstack_manifests
-  when: inventory_hostname == groups['kube_control_plane'][0]
+  when:
+    - not hosted_k8s
+    - inventory_hostname == groups['kube_control_plane'][0]
   tags: external-openstack-secret
 
 - name: External OpenStack Cloud Controller | Apply Manifests
@@ -43,8 +48,64 @@
   with_items:
     - "{{ external_openstack_manifests.results }}"
   when:
+    - not hosted_k8s
     - inventory_hostname == groups['kube_control_plane'][0]
     - not item is skipped
   loop_control:
     label: "{{ item.item.file }}"
   tags: external-openstack-secret
+
+# 托管版K8s支持
+
+- name: External OpenStack Cloud Controller | Get base64 cacert (hosted k8s)
+  slurp:
+    src: "{{ external_openstack_cacert }}"
+  register: external_openstack_cacert_b64
+  when:
+    - hosted_k8s | default(false)
+    - external_openstack_cacert is defined
+    - external_openstack_cacert | length > 0
+  tags: external-openstack-secret
+  delegate_to: localhost
+  run_once: true
+
+- name: External OpenStack Cloud Controller | Get base64 cloud-config (hosted k8s)
+  set_fact:
+    external_openstack_cloud_config_secret: "{{ lookup('template', 'external-openstack-cloud-config.j2') | b64encode }}"
+  when: hosted_k8s | default(false)
+  tags: external-openstack-secret
+  delegate_to: localhost
+  run_once: true
+
+- name: External OpenStack Cloud Controller | Generate Manifests (hosted k8s)
+  template:
+    src: "{{ item.file }}.j2"
+    dest: "{{ kube_config_dir }}/{{ item.file }}"
+    group: "{{ kube_cert_group }}"
+    mode: "0640"
+  with_items:
+    - {name: external-openstack-cloud-config-secret, file: external-openstack-cloud-config-secret.yml}
+    - {name: csi-manila-secret, file: csi-manila-secret.yml}
+  register: external_openstack_manifests_hosted
+  when: hosted_k8s | default(false)
+  tags: external-openstack-secret
+  delegate_to: localhost
+  run_once: true
+
+- name: External OpenStack Cloud Controller | Apply Manifests (hosted k8s)
+  kube:
+    kubectl: "{{ local_bin_dir }}/{{ kube_version }}/kubectl"
+    filename: "{{ item.dest }}"
+    state: "latest"
+  with_items:
+    - "{{ external_openstack_manifests_hosted.results }}"
+  when:
+    - hosted_k8s | default(false)
+    - not item is skipped
+  loop_control:
+    label: "{{ item.item.file }}"
+  tags: external-openstack-secret
+  delegate_to: localhost
+  run_once: true
+  environment:
+    KUBECONFIG: "{{ tenant_cluster_kubeconfig }}"

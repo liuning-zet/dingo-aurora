@@ -105,6 +105,7 @@
     - { role: kubernetes/node-taint, tags: node-taint }
     - { role: kubernetes-apps/policy_controller, tags: policy-controller, when: hosted_k8s }
     - { role: network_plugin, tags: network}
+    - { role: kubernetes-apps/install_cloud_provider_seecret, tags: install-cloud-provider-secret, when: hosted_k8s and install_cloud_provider_manager_enabled }
 
 - name: Apply resolv.conf changes now that cluster DNS is up
   hosts: k8s_cluster
