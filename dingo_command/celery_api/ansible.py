@@ -62,7 +62,8 @@ def run_playbook(playbook_name, inventory, data_dir, ssh_key, extravars=None, li
             f.write(f"/usr/sbin/ip netns exec {netns} ssh \"$@\"\n")
         os.chmod(script_path, 0o755)
         envvars["ANSIBLE_SSH_EXECUTABLE"] = script_path
-    
+        #os.environ["ANSIBLE_SSH_EXECUTABLE"] = script_path
+    ident = cluster_id
     inventory_file = os.path.join(inventory, "hosts")
     # 运行 Ansible playbook 异步
     thread, runner = ansible_runner.run_async(
@@ -75,6 +76,7 @@ def run_playbook(playbook_name, inventory, data_dir, ssh_key, extravars=None, li
         ssh_key=ssh_key,
         limit=limit,
         forks=50,
+        ident=ident
     )
 
     return thread,runner

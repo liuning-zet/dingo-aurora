@@ -677,7 +677,7 @@ def render_templatefile(template_file, cluster_file, context):
             loader=FileSystemLoader(template_dir),
             variable_start_string='${',
             variable_end_string='}',
-            autoescape=True
+            autoescape=False
         )
 
     # 获取模板并渲染
