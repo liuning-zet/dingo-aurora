@@ -89,3 +89,7 @@ public-network-name="{{ network_name }}"
 {% if external_openstack_metadata_search_order is defined %}
 search-order="{{ external_openstack_metadata_search_order }}"
 {% endif %}
+
+[LoadBalancer "internetFacing"]
+subnet-id={{ external_openstack_lbaas_public_subnet_id }}
+floating-network-id={{ external_openstack_lbaas_public_network_id }}
