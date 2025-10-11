@@ -1,9 +1,10 @@
 # 数据表对应的model对象
 
 from __future__ import annotations
+from dingo_command.common.common import dingo_print
 from dingo_command.db.engines.mysql import get_session
 from dingo_command.db.models.ai_instance.models import AiK8sConfigs, AiInstanceInfo, AiK8sNodeResourceInfo, AccountInfo, \
-    AiInstancePortsInfo, AiInstanceGpuCardInfo
+    AiInstancePortsInfo, AiInstanceGpuCardInfo, AiInstanceRelationTenantInfo
 
 # 容器实例排序字段字典
 ai_instance_dir_dic= {"instance_name":AiInstanceInfo.instance_name}
@@ -317,3 +318,61 @@ class AiInstanceSQL:
         session = get_session()
         with session.begin():
             return session.query(AiInstanceGpuCardInfo).filter(AiInstanceGpuCardInfo.gpu_key == gpu_key).first()
+
+    # ========================以下为 ai instance tenant 相关 ===================================
+    @classmethod
+    def list_ai_instance_relation_tenant_info_by_k8s_id(cls, k8s_id):
+        session = get_session()
+        with session.begin():
+            return [row.tenant_id for row in session.query(AiInstanceRelationTenantInfo.tenant_id).filter(
+                AiInstanceRelationTenantInfo.k8s_id == k8s_id).all()]
+
+    @classmethod
+    def list_ai_instance_relation_tenant_info(cls):
+        session = get_session()
+        with session.begin():
+            return [row.tenant_id for row in session.query(AiInstanceRelationTenantInfo.tenant_id).all()]
+
+    @classmethod
+    def get_ai_instance_relation_tenant_info_by_tenant_id(cls, k8s_id, tenant_id):
+        session = get_session()
+        with session.begin():
+            return session.query(AiInstanceRelationTenantInfo).filter(AiInstanceRelationTenantInfo.k8s_id == k8s_id,
+                                                                      AiInstanceRelationTenantInfo.tenant_id == tenant_id).first()
+
+    @classmethod
+    def save_ai_instance_relation_tenant_info(cls, ai_instance_relation_tenant_info):
+        session = get_session()
+        with session.begin():
+            if ai_instance_relation_tenant_info:
+                if isinstance(ai_instance_relation_tenant_info, list):
+                    session.add_all(ai_instance_relation_tenant_info)
+                else:
+                    session.add(ai_instance_relation_tenant_info)
+
+    @classmethod
+    def save_non_existent_tenant_ids_simple(cls, k8s_id, tenant_id_list):
+        session = get_session()
+        with session.begin():
+            # 去重并检查空输入
+            distinct_tenant_ids = list(set(tenant_id_list))
+            if not distinct_tenant_ids:
+                return
+
+            dingo_print(f"save_non_existent_tenant_ids_simple:  k8s_id={k8s_id}, distinct_tenant_ids={distinct_tenant_ids}")
+            # 查询已存在的 tenant_id
+            existing_query = session.query(AiInstanceRelationTenantInfo.tenant_id.label("tenant_id")).filter(
+                AiInstanceRelationTenantInfo.tenant_id.in_(distinct_tenant_ids)
+            )
+            existing_ids = {result.tenant_id for result in existing_query}
+            # need to insert ids
+            ids_to_insert = set(distinct_tenant_ids) - existing_ids
+
+            # need to insert
+            if not ids_to_insert:
+                return
+            dingo_print(f"save_non_existent_tenant_ids_simple: k8s_id={k8s_id}, existing_ids={existing_ids}, ids_to_insert={ids_to_insert}")
+            new_records = [AiInstanceRelationTenantInfo(k8s_id=k8s_id, tenant_id=tid) for tid in ids_to_insert]
+
+            session.add_all(new_records)
+            dingo_print(f"save_non_existent_tenant_ids_simple: k8s_id={k8s_id} inserted {len(new_records)} new tenant IDs")

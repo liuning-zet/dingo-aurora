@@ -46,7 +46,7 @@ class CustomCallback(CallbackBase):
 #     os.close(fd)
 #     print(f"已切换到netns: {namespace}")
 
-def run_playbook(playbook_name, inventory, data_dir, ssh_key, extravars=None, limit=None, netns=None):
+def run_playbook(playbook_name, inventory, data_dir, ssh_key, extravars=None, limit=None, netns=None, cluster_id: str=None):
     # 设置环境变量
     envvars = {
         "ANSIBLE_FORKS": 10,
@@ -54,9 +54,9 @@ def run_playbook(playbook_name, inventory, data_dir, ssh_key, extravars=None, li
         "CURRENT_DIR": inventory,
     }
     # 如果指定了 netns，则修改环境变量
-    if netns:
+    if netns and netns != "":
         # Create the netns_ssh.sh script
-        script_path = os.path.join(data_dir, "netns_ssh.sh")
+        script_path = os.path.join(data_dir, "inventory", cluster_id, "netns_ssh.sh")
         with open(script_path, "w") as f:
             f.write("#!/bin/bash\n")
             f.write(f"/usr/sbin/ip netns exec {netns} ssh \"$@\"\n")

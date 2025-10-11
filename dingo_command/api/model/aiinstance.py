@@ -5,12 +5,12 @@ from pydantic import BaseModel, Field
 
 
 class InstanceConfigObj(BaseModel):
-    replica_count: Optional[int] = Field(None, description="实例副本个数")
+    replica_count: Optional[int] = Field(1, description="实例副本个数")
     compute_cpu: Optional[str] = Field(None, description="计算资源CPU")
     compute_memory: Optional[str] = Field(None, description="计算资源内存")
     gpu_model: Optional[str] = Field(None, description="GPU型号")
     gpu_count: Optional[int] = Field(None, description="GPU卡数")
-    system_disk_size: Optional[str] = Field(None, description="系统盘大小(默认单位Gib)")
+    system_disk_size: Optional[str] = Field("50", description="系统盘大小(默认单位Gib)")
 
 class StorageObj(BaseModel):
     pvc_name: Optional[str] = Field(None, description="pvc名称")

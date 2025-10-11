@@ -8,7 +8,6 @@ import time
 import uuid
 from datetime import datetime
 from func_timeout import func_timeout, FunctionTimedOut
-from typing import Optional
 from functools import wraps, partial
 
 from tenacity import retry, stop_after_attempt, retry_if_exception, wait_fixed
@@ -16,9 +15,8 @@ from keystoneclient import client
 from math import ceil
 from kubernetes.client import V1PersistentVolumeClaim, V1ObjectMeta, V1PersistentVolumeClaimSpec, \
     V1ResourceRequirements, V1PodTemplateSpec, V1StatefulSet, V1LabelSelector, V1Container, V1VolumeMount, V1Volume, \
-    V1ConfigMapVolumeSource, V1EnvVar, V1PodSpec, V1StatefulSetSpec, V1ContainerPort, V1Toleration, V1Affinity, \
-    V1PodAffinity, \
-    V1WeightedPodAffinityTerm, V1PodAffinityTerm, V1LabelSelectorRequirement, V1HostPathVolumeSource, V1SecurityContext
+    V1ConfigMapVolumeSource, V1EnvVar, V1PodSpec, V1StatefulSetSpec, V1ContainerPort, V1HostPathVolumeSource, V1SecurityContext, \
+    V1EmptyDirVolumeSource
 from kubernetes import client
 from kubernetes.stream import stream
 
@@ -26,24 +24,21 @@ from dingo_command.api.model.aiinstance import AddPortModel
 from dingo_command.common.common import dingo_print
 from dingo_command.common.Enum.AIInstanceEnumUtils import AiInstanceStatus, K8sStatus
 from dingo_command.common.k8s_common_operate import K8sCommonOperate
-from dingo_command.db.models.ai_instance.models import AiInstanceInfo, AccountInfo, AiInstancePortsInfo
+from dingo_command.db.models.ai_instance.models import AiInstanceInfo, AccountInfo, AiInstancePortsInfo, \
+    AiInstanceRelationTenantInfo
 from dingo_command.db.models.ai_instance.sql import AiInstanceSQL
 from dingo_command.db.models.system.sql import SystemSQL
 from dingo_command.services.harbor import HarborService
-from dingo_command.services.redis_connection import redis_connection, RedisLock
-from dingo_command.utils.constant import CCI_NAMESPACE_PREFIX, RESOURCE_TYPE_KEY, PRODUCT_TYPE_CCI, \
-    AI_INSTANCE_PVC_MOUNT_PATH_DEFAULT, \
-    APP_LABEL, AI_INSTANCE_CM_MOUNT_PATH_SSHKEY, AI_INSTANCE_CM_MOUNT_PATH_SSHKEY_SUB_PATH, CONFIGMAP_PREFIX, \
-    DEV_TOOL_JUPYTER, \
-    SAVE_TO_IMAGE_CCI_PREFIX, GPU_POD_LABEL_KEY, GPU_POD_LABEL_VALUE, CCI_STS_PREFIX, CCI_STS_POD_SUFFIX, INGRESS_SIGN, \
+from dingo_command.services.redis_connection import redis_connection, RedisLock, CCI_SAVE_TO_IMAGE_REDIS_KEY_PREFIX
+from dingo_command.utils.constant import (CCI_NAMESPACE_PREFIX, RESOURCE_TYPE_KEY, PRODUCT_TYPE_CCI, \
+    AI_INSTANCE_PVC_MOUNT_PATH_DEFAULT, APP_LABEL, AI_INSTANCE_CM_MOUNT_PATH_SSHKEY, AI_INSTANCE_CM_MOUNT_PATH_SSHKEY_SUB_PATH,
+    CONFIGMAP_PREFIX, DEV_TOOL_JUPYTER, SAVE_TO_IMAGE_CCI_PREFIX, CCI_STS_PREFIX, CCI_STS_POD_SUFFIX, INGRESS_SIGN, \
     HYPHEN_SIGN, POINT_SIGN, JUPYTER_INIT_MOUNT_NAME, JUPYTER_INIT_MOUNT_PATH, HARBOR_PULL_IMAGE_SUFFIX, \
-    CPU_OVER_COMMIT, MIN_CPU_REQUEST, CPU_POD_SLOT_KEY, CCI_SYNC_K8S_NODE_REDIS_KEY, CCI_TIME_OUT_DEFAULT
+    CPU_OVER_COMMIT, MIN_CPU_REQUEST, CPU_POD_SLOT_KEY, CCI_SYNC_K8S_NODE_REDIS_KEY, CCI_TIME_OUT_DEFAULT)
 from dingo_command.utils.customer_thread_pool import queuedThreadPool
-from dingo_command.utils.k8s_client import get_k8s_core_client, get_k8s_app_client, get_k8s_networking_client
+from dingo_command.utils.k8s_client import get_k8s_core_client, get_k8s_app_client, get_k8s_networking_client, get_alayanew_k8s_custom_object_client
 from dingo_command.services.custom_exception import Fail
 import threading
-from typing import Dict, Any
-from functools import lru_cache
 
 k8s_common_operate = K8sCommonOperate()
 harbor_service = HarborService()
@@ -113,24 +108,24 @@ class AiInstanceService:
     # 类级别的客户端缓存和线程锁
     _k8s_clients_cache: dict[str, dict[str, object]] = {}
     _cache_lock = threading.Lock()
-    
+
     @classmethod
     def _get_cached_k8s_clients(cls, k8s_id):
         """
         获取缓存的K8s客户端实例（线程安全）
-        
+
         Args:
             k8s_id: Kubernetes集群ID
-            
+
         Returns:
             dict: 包含core、app、networking三种客户端的字典
-            
+
         Note:
-            使用双重检查锁定模式确保线程安全: 
+            使用双重检查锁定模式确保线程安全:
             1. 首次检查避免不必要的锁获取
             2. 加锁后再次检查确保只有一个线程创建客户端
             3. 每个k8s_id的客户端只创建一次并缓存
-            
+
         Warning:
             K8s Python客户端不是线程安全的，多线程环境下需要谨慎使用
             建议每个线程使用独立的客户端实例
@@ -149,8 +144,44 @@ class AiInstanceService:
                     dingo_print(f"Created and cached K8s clients for k8s_id: {k8s_id}")
         else:
             dingo_print(f"Using cached K8s clients for k8s_id: {k8s_id}")
-        
+
         return cls._k8s_clients_cache[k8s_id]
+
+    @classmethod
+    def _get_alayanew_cached_k8s_clients(cls, alayanew_k8s_kubeconfig_key=None):
+        """
+        获取缓存的K8s客户端实例（线程安全）
+
+        Args:
+            k8s_id: Kubernetes集群ID
+
+        Returns:
+            dict: 包含core、app、networking三种客户端的字典
+
+        Note:
+            使用双重检查锁定模式确保线程安全:
+            1. 首次检查避免不必要的锁获取
+            2. 加锁后再次检查确保只有一个线程创建客户端
+            3. 每个k8s_id的客户端只创建一次并缓存
+
+        Warning:
+            K8s Python客户端不是线程安全的，多线程环境下需要谨慎使用
+            建议每个线程使用独立的客户端实例
+        """
+        # 双重检查锁定模式（Double-Checked Locking）
+        if alayanew_k8s_kubeconfig_key and alayanew_k8s_kubeconfig_key not in cls._k8s_clients_cache:
+            with cls._cache_lock:
+                # 再次检查，防止其他线程已经创建了客户端
+                if alayanew_k8s_kubeconfig_key not in cls._k8s_clients_cache:
+                    # 创建并缓存客户端实例
+                    cls._k8s_clients_cache[alayanew_k8s_kubeconfig_key] = {
+                       "alayanew_custom": get_alayanew_k8s_custom_object_client(alayanew_k8s_kubeconfig_key)
+                    }
+                    dingo_print(f"Created and cached K8s clients for k8s_id: {alayanew_k8s_kubeconfig_key}")
+        else:
+            dingo_print(f"Using cached K8s clients for alayanew_k8s_kubeconfig_key: {alayanew_k8s_kubeconfig_key}")
+
+        return cls._k8s_clients_cache[alayanew_k8s_kubeconfig_key]
     
     @classmethod
     def _clear_k8s_clients_cache(cls, k8s_id=None):
@@ -180,6 +211,11 @@ class AiInstanceService:
     def get_cached_networking_client(cls, k8s_id):
         """获取缓存的网络K8s客户端"""
         return cls._get_cached_k8s_clients(k8s_id)['networking']
+
+    @classmethod
+    def get_alayanew_cached_custom_client(cls, alayanew_kubeconfig_key):
+        """获取缓存的核心K8s客户端"""
+        return cls._get_alayanew_cached_k8s_clients(alayanew_kubeconfig_key)['alayanew_custom']
     
     @classmethod
     def create_thread_local_clients(cls, k8s_id):
@@ -432,14 +468,15 @@ class AiInstanceService:
         异步保存AI实例为镜像（立即返回，实际操作在后台执行）
         """
         try:
-            redis_key = SAVE_TO_IMAGE_CCI_PREFIX + id
-            value = redis_connection.get_redis_by_key(redis_key)
-            if value:
-                return {
-                    "instance_id": id,
-                    "process_status": "Saving",
-                    "image": value
-                }
+            fields_value = redis_connection.hget_all(CCI_SAVE_TO_IMAGE_REDIS_KEY_PREFIX+id)
+            if fields_value:
+                latest_key = max(fields_value, key=lambda x: fields_value[x])
+                if latest_key:
+                    return {
+                        "instance_id": id,
+                        "process_status": "Saving",
+                        "image": latest_key
+                    }
 
         except Exception as e:
             dingo_print(f"Failed to start save operation for instance {id}: {str(e)}")
@@ -524,7 +561,8 @@ class AiInstanceService:
         """
 
         # 存入redis，镜像推送完成标识
-        redis_key = SAVE_TO_IMAGE_CCI_PREFIX + id
+        redis_key = CCI_SAVE_TO_IMAGE_REDIS_KEY_PREFIX+id
+        field = f"{image_name}:{image_tag}"
         try:
             # 获取harbor信息
             harbor_address, harbor_username, harbor_password = self.get_harbor_info(ai_instance_info_db.instance_k8s_id)
@@ -539,7 +577,8 @@ class AiInstanceService:
             nerdctl_api_pod = self._get_nerdctl_api_pod(core_k8s_client, sts_pod_info['node_name'])
            
             
-            redis_connection.set_redis_by_key_with_expire(redis_key, f"{image_name}:{image_tag}", CCI_TIME_OUT_DEFAULT)
+            ai_instance_info_db = AiInstanceSQL.get_ai_instance_info_by_id(id)
+            redis_connection.hset_with_expire(CCI_SAVE_TO_IMAGE_REDIS_KEY_PREFIX+id, f"{image_name}:{image_tag}", ai_instance_info_db.instance_status, CCI_TIME_OUT_DEFAULT)
 
             # 1. Harbor登录
             self._harbor_login(core_k8s_client, nerdctl_api_pod, harbor_address, harbor_username, harbor_password)
@@ -555,13 +594,13 @@ class AiInstanceService:
             # 3. Push操作
             self._push_image(core_k8s_client, nerdctl_api_pod, image)
             # 判断是否完成标识
-            redis_connection.set_redis_by_key_with_expire(redis_key + "_flag", "true", 10)
+            redis_connection.hset_with_expire(redis_key + "_flag", field, "true", 10)
             dingo_print(f" ai instance[{id}] push image container ID: {clean_container_id}, image_tag: [{image_name}:{image_tag}] finished")
         except Exception as e:
             dingo_print(f"Async save operation failed for instance {id}: {str(e)}")
             raise e
         finally:
-            redis_connection.delete_redis_key(redis_key)
+            redis_connection.hdel(redis_key, field)
             self.get_or_set_update_k8s_node_resource_redis()
 
     def _execute_k8s_command(self, core_k8s_client, pod_name, namespace, command):
@@ -785,6 +824,10 @@ class AiInstanceService:
             k8s_common_operate.create_ai_instance_ns(self.core_k8s_client, namespace_name)
             dingo_print(f"Created namespace: {namespace_name}")
 
+            # create network policy for namespace
+            k8s_common_operate.create_network_policy(self.networking_k8s_client, namespace_name)
+            dingo_print(f"Created network policy for namespace: {namespace_name}")
+
         return namespace_name
 
     def _convert_to_db_model(self, ai_instance) -> AiInstanceInfo:
@@ -810,7 +853,7 @@ class AiInstanceService:
 
     def _create_single_instance(self, ai_instance, ai_instance_db):
         """创建单个实例"""
-        resource_config = self._prepare_resource_config(ai_instance.instance_config)
+        resource_config = self._prepare_resource_config(ai_instance.instance_config, ai_instance_db.instance_k8s_id)
 
         # 设置实例ID
         ai_instance_db.id = ai_instance.instance_id or uuid.uuid4().hex
@@ -826,7 +869,7 @@ class AiInstanceService:
 
     def _create_multiple_instances(self, ai_instance, ai_instance_db, namespace_name):
         """创建多个实例副本"""
-        resource_config = self._prepare_resource_config(ai_instance.instance_config)
+        resource_config = self._prepare_resource_config(ai_instance.instance_config, ai_instance_db.instance_k8s_id)
         results = []
 
         for i in range(ai_instance.instance_config.replica_count):
@@ -835,23 +878,13 @@ class AiInstanceService:
                 ai_instance, instance_copy, namespace_name, resource_config
             )
 
-            # self._start_async_check_task(
-            #     self.core_k8s_client,
-            #     ai_instance_db.instance_k8s_id,
-            #     instance_result.id,
-            #     f"{instance_result.instance_real_name}{CCI_STS_POD_SUFFIX}",
-            #     CCI_NAMESPACE_PREFIX + ai_instance_db.instance_tenant_id
-            # )
-
             results.append(self.assemble_ai_instance_return_result(instance_result))
 
         return results
 
-    def _prepare_resource_config(self, instance_config):
+    def _prepare_resource_config(self, instance_config, K8s_id):
         resource_limits = []
         resource_requests = []
-        node_selector_gpu = {}
-        toleration_gpus = []
 
         if instance_config.gpu_model:
             gpu_card_info = AiInstanceSQL.get_gpu_card_info_by_gpu_model_display(instance_config.gpu_model)
@@ -863,13 +896,13 @@ class AiInstanceService:
             # 定义资源requests
             resource_requests = {'cpu': int(instance_config.compute_cpu), 'memory': instance_config.compute_memory + "Gi",
                                gpu_card_info.gpu_key: instance_config.gpu_count, 'ephemeral-storage': "1024Mi"}
-            # node_selector_gpu['nvidia.com/gpu.product'] = gpu_card_info.gpu_node_label
-            # 容忍度
-            # toleration_gpus.append(V1Toleration(
-            #     key=gpu_card_info.gpu_node_label,
-            #     operator="Exists",
-            #     effect="NoSchedule"
-            # ))
+            if instance_config.gpu_count == 8:
+                ai_k8s_configs_db = AiInstanceSQL.get_k8s_configs_info_by_k8s_id(K8s_id)
+                if ai_k8s_configs_db and ai_k8s_configs_db.gpu_relation_ib_device:
+                    # GPU 8卡场景，添加RDMA支持
+                    resource_limits.update(json.loads(ai_k8s_configs_db.gpu_relation_ib_device))
+                    resource_requests.update(json.loads(ai_k8s_configs_db.gpu_relation_ib_device))
+                    dingo_print(f"gpu 8 count scene, ai instance {instance_config.gpu_model} gpu model[{instance_config.gpu_model}] resource_limits:{resource_limits}, resource_requests:{resource_requests}")
         elif instance_config.compute_cpu:
             # 定义资源requests
             resource_requests = {'cpu': self.safe_divide(instance_config.compute_cpu),
@@ -883,8 +916,6 @@ class AiInstanceService:
         return {
             'resource_limits': resource_limits,
             'resource_requests': resource_requests,
-            'node_selector_gpu': node_selector_gpu,
-            'toleration_gpus': toleration_gpus,
             "system_disk_size": instance_config.system_disk_size
         }
 
@@ -958,12 +989,19 @@ class AiInstanceService:
             self.networking_k8s_client, namespace_name, ai_instance_db.instance_real_name,
             host_domain, nb_prefix
         )
+        dingo_print(f"create cci ingress rule :{namespace_name}/{ai_instance_db.instance_real_name}-{INGRESS_SIGN}, host:{host_domain}, path:{nb_prefix}")
         self._wait_for_resource(self.core_k8s_client, self.app_k8s_client, self.networking_k8s_client,
                                 namespace_name, f"{ai_instance_db.instance_real_name}-{INGRESS_SIGN}", client.V1Ingress)
 
+        dingo_print(f"create cci ingress rule success:{namespace_name}/{ai_instance_db.instance_real_name}-{INGRESS_SIGN}")
+
         # 6、创建StatefulSet
         sts_data = self._assemble_sts_data(ai_instance, ai_instance_db, namespace_name, resource_config, nb_prefix)
+        dingo_print(f"create cci sts data :{sts_data}")
+
         k8s_common_operate.create_sts_pod(self.app_k8s_client, namespace_name, sts_data)
+
+        dingo_print(f"create cci sts success:{namespace_name}/{ai_instance_db.instance_real_name}")
 
 
     def _wait_for_resource(self, core_v1_client, app_v1_client, networking_v1_client, namespace, name, resource_type, timeout=60):
@@ -1062,14 +1100,22 @@ class AiInstanceService:
         Returns:
             V1StatefulSet: 组装好的Kubernetes StatefulSet对象。
         """
+
+        dingo_print(f"_assemble_sts_data===start ai_instance:{ai_instance} ai_instance_db:{ai_instance_db}, resource_config:{resource_config}, nb_prefix:{nb_prefix}, namespace_name:{namespace_name}")
+
         # 解包资源配置
         resource_limits = resource_config['resource_limits']
         resource_requests = resource_config['resource_requests']
-        node_selector_gpu = resource_config['node_selector_gpu']
-        toleration_gpus = resource_config['toleration_gpus']
+        # node_selector_gpu = resource_config['node_selector_gpu']
+        # toleration_gpus = resource_config['toleration_gpus']
+
+        dingo_print(f"_assemble_sts_data===resource_limits:{resource_limits}, resource_requests:{resource_requests}")
 
         # 环境变量处理
         env_vars_dict = json.loads(ai_instance_db.instance_envs) if ai_instance_db.instance_envs else {}
+
+        dingo_print(f"_assemble_sts_data===before env_vars_dict:{env_vars_dict}, resource_limits:{resource_limits}")
+        
         env_vars_dict['NB_PREFIX'] = nb_prefix
         if "JUPYTER_TOKEN" not in env_vars_dict.keys():
             env_vars_dict['JUPYTER_TOKEN'] = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
@@ -1078,6 +1124,7 @@ class AiInstanceService:
             for key, value in env_vars_dict.items()
         ]
 
+        dingo_print(f"_assemble_sts_data===before env_list:{env_list}, resource_limits:{resource_limits}")
 
         # 准备Volume和VolumeMount
         volume_mounts = [
@@ -1085,8 +1132,22 @@ class AiInstanceService:
                 name=JUPYTER_INIT_MOUNT_NAME,  # 卷名称，需与下面定义的卷匹配
                 mount_path=JUPYTER_INIT_MOUNT_PATH,  # 容器内的挂载路径
                 read_only = True # 将此挂载设置为只读
+            ),
+            V1VolumeMount(
+                name="public",  # 卷名称
+                mount_path="/root/public",  # 容器内的挂载路径
+                read_only=True  # 将此挂载设置为只读
+            ),
+            V1VolumeMount(
+                name="tz",
+                mount_path="/etc/localtime",  # 容器内的挂载路径
+                read_only=True  # 将此挂载设置为只读
             )
+
         ]
+
+        dingo_print(f"_assemble_sts_data===before pod_volumes volume_mounts:{volume_mounts}")
+
         pod_volumes = [
             V1Volume(
                 name=JUPYTER_INIT_MOUNT_NAME,
@@ -1094,8 +1155,56 @@ class AiInstanceService:
                     path="/" + JUPYTER_INIT_MOUNT_NAME,  # 宿主机上的路径
                     type="DirectoryOrCreate"  # 类型: 如果目录不存在则创建
                 )
+            ),
+            V1Volume(
+                name="public",
+                host_path=V1HostPathVolumeSource(
+                    path="/mnt/public",  # 宿主机上的路径
+                )
+            ),
+            V1Volume(
+                name="tz",
+                host_path=V1HostPathVolumeSource(
+                    path="/etc/localtime",  # 宿主机上的时区路径
+                )
             )
+
         ]
+
+        dingo_print(f"_assemble_sts_data===before gpu check pod_volumes count:{len(pod_volumes)}, volume_mounts count:{len(volume_mounts)}, resource_limits:{resource_limits}")
+
+        # 检查是否包含GPU资源，如果有则添加共享内存卷
+        gpu_detected = False
+        for key in resource_limits:
+            if key.startswith("nvidia.com/gpu") or key.startswith("amd.com/gpu"):
+                dingo_print(f"_assemble_sts_data===detected GPU resource key:{key}, adding shared memory volume")
+                
+                # 添加共享内存卷挂载（GPU任务通常需要大容量共享内存）
+                volume_mounts.append(V1VolumeMount(
+                    name="dshm",  # 共享内存卷名
+                    mount_path="/dev/shm"  # 容器内的挂载路径
+                ))
+                
+                # 添加共享内存卷定义
+                pod_volumes.append(V1Volume(
+                    name="dshm",  # 共享内存卷名，与上面的name对应
+                    empty_dir=V1EmptyDirVolumeSource(
+                        medium="Memory",  # 使用内存作为存储介质
+                        size_limit="32Gi"  # 设置卷的大小限制为32GiB，满足GPU计算需求
+                    )
+                ))
+                gpu_detected = True
+                break  # 只需要添加一次共享内存卷
+        
+        if gpu_detected:
+            dingo_print(f"_assemble_sts_data===GPU instance detected, added shared memory volume")
+        else:
+            dingo_print(f"_assemble_sts_data===CPU-only instance, no shared memory volume needed")
+
+        # 大容量存储处理
+        pod_volumes, volume_mounts = self.get_large_capacity_storage_mount_info(ai_instance_db, pod_volumes, volume_mounts)
+
+        dingo_print(f"_assemble_sts_data===after get_large_capacity_storage_mount_info pod_volumes:{pod_volumes}, volume_mounts:{volume_mounts}")
 
         # 处理PVC (从ai_instance.volumes中获取信息)
         pvc_template = None
@@ -1112,6 +1221,7 @@ class AiInstanceService:
                     )
                 )
             )
+        dingo_print(f"_assemble_sts_data===after pvc_template pod_volumes:{pod_volumes}, volume_mounts:{volume_mounts}, pvc_template:{pvc_template}")
 
         # 添加SSH公钥的ConfigMap (固定逻辑)
         configmap_name_ssh = CONFIGMAP_PREFIX + ai_instance.user_id
@@ -1158,8 +1268,6 @@ class AiInstanceService:
             command=["/anc-init/script/anc-init"],
         )
 
-        # 亲和性
-        # affinity = self.create_affinity(node_selector_gpu)
         # pod标签
         pod_template_labels = self.build_pod_template_labels(ai_instance_db, ai_instance_db.product_code, resource_limits)
 
@@ -1170,21 +1278,12 @@ class AiInstanceService:
                 annotations={"dc.com/quota.xfs.size": f"{ai_instance.instance_config.system_disk_size}g"}
             ),
             spec=V1PodSpec(
-                # node_name=self.choose_k8s_node(ai_instance_db.instance_k8s_id,
-                #                                int(ai_instance.instance_config.compute_cpu),
-                #                                int(ai_instance.instance_config.compute_memory),
-                #                                int(ai_instance.instance_config.system_disk_size),
-                #                                self.find_gpu_key_by_display(ai_instance.instance_config.gpu_model),
-                #                                ai_instance.instance_config.gpu_count),
                 scheduler_name = "volcano",
                 containers=[container],
                 enable_service_links=False,
                 termination_grace_period_seconds = 5,
                 security_context=pod_security_context,
                 volumes=pod_volumes,
-                # node_selector=node_selector_gpu,  # 使用传入的GPU节点选择器
-                # tolerations=toleration_gpus,  # 使用传入的GPU容忍度
-                # affinity=affinity
             )
         )
 
@@ -1210,6 +1309,39 @@ class AiInstanceService:
         )
 
         return sts_data
+
+    def get_large_capacity_storage_mount_info(self, ai_instance_db, pod_volumes, volume_mounts):
+
+        dingo_print(f"get_large_capacity_storage_mount_info===start ai_instance_db:{ai_instance_db}, pod_volumes:{pod_volumes}, volume_mounts:{volume_mounts}")
+        
+        if not pod_volumes:
+            pod_volumes = []
+        if not volume_mounts:
+            volume_mounts = []
+
+        # 查询alayanew 大容量存储路径
+        large_capacity_storage_path = self.get_large_capacity_storage_fs_shared_volume_path(ai_instance_db.instance_tenant_id)
+        if large_capacity_storage_path:
+            dingo_print(f"large_capacity_storage_path: {large_capacity_storage_path}")
+            volume_mounts.append(
+                V1VolumeMount(
+                    name="large-capacity-storage",
+                    mount_path="/root/userdata"  # 容器内的挂载路径,
+                )
+            )
+            pod_volumes.append(
+                V1Volume(
+                    name="large-capacity-storage",
+                    host_path=V1HostPathVolumeSource(
+                        path=f"/mnt/capacity{large_capacity_storage_path}/share",  # 宿主机上的路径
+
+                    )
+                )
+            )
+
+        dingo_print(f"get_large_capacity_storage_mount_info===end pod_volumes:{pod_volumes}, volume_mounts:{volume_mounts}")
+        
+        return pod_volumes, volume_mounts
 
     def start_ai_instance_by_id(self, id, request):
         try:
@@ -1278,15 +1410,18 @@ class AiInstanceService:
         # 提取资源配置
         resource_limits = resource_config.get('resource_limits', {})
         resource_requests = resource_config.get('resource_requests', {})
-        node_selector_gpu = resource_config.get('node_selector_gpu', {})
-        toleration_gpus = resource_config.get('toleration_gpus', [])
         system_disk_size = resource_config.get('system_disk_size', 50)
-
-        # 创建亲和性配置
-        # affinity = self.create_affinity(node_selector_gpu)
 
         # 构建Pod模板标签
         pod_template_labels = self.build_pod_template_labels(ai_instance_info_db, request.product_code if request and request.product_code else ai_instance_info_db.product_code, resource_limits)
+
+        # 处理大容量存储挂载信息
+        pod_volumes, volume_mounts = self.handle_large_capacity_storage_mount_info(ai_instance_info_db, existing_sts)
+
+        # 3. 应用新的存储配置
+        # 添加新的卷到volumes、mount列表
+        existing_sts.spec.template.spec.volumes = pod_volumes
+        existing_sts.spec.template.spec.containers[0].volume_mounts = volume_mounts
 
         # 更新existing_sts的各个字段
         existing_sts.metadata.resource_version = None
@@ -1295,6 +1430,7 @@ class AiInstanceService:
         existing_sts.spec.template.spec.containers[0].name = ai_instance_info_db.instance_real_name
         existing_sts.spec.template.spec.containers[0].image = image_name
         existing_sts.spec.template.spec.containers[0].image_pull_policy = "Always"
+
         if resource_limits:
             existing_sts.spec.template.spec.containers[0].resources = V1ResourceRequirements(
                 requests=resource_requests,
@@ -1302,6 +1438,29 @@ class AiInstanceService:
             )
 
         return existing_sts
+
+    def handle_large_capacity_storage_mount_info(self, ai_instance_info_db, existing_sts):
+        # 1. 移除旧的 large-capacity-storage 卷配置
+        # 从 volumes 中移除
+        if hasattr(existing_sts.spec.template.spec, 'volumes') and existing_sts.spec.template.spec.volumes:
+            existing_sts.spec.template.spec.volumes = [
+                volume for volume in existing_sts.spec.template.spec.volumes
+                if volume.name != 'large-capacity-storage'
+            ]
+        # 从每个容器的 volumeMounts 中移除
+        for container in existing_sts.spec.template.spec.containers:
+            if hasattr(container, 'volume_mounts') and container.volume_mounts:
+                container.volume_mounts = [
+                    mount for mount in container.volume_mounts
+                    if mount.name != 'large-capacity-storage'
+                ]
+        # 2. 获取新的大容量存储挂载信息
+        pod_volumes, volume_mounts = self.get_large_capacity_storage_mount_info(
+            ai_instance_info_db,
+            existing_sts.spec.template.spec.volumes,  # 传入移除了大容量存储volumes
+            existing_sts.spec.template.spec.containers[0].volume_mounts  # 传入现存的移除了大容量存储的volume_mounts开
+        )
+        return pod_volumes, volume_mounts
 
     def build_pod_template_labels(self, ai_instance_info_db, product_code, resource_limits):
         """构建Pod模板的标签"""
@@ -1320,39 +1479,8 @@ class AiInstanceService:
         # 添加产品代码（如果存在）
         if product_code:
             labels["dc.com/params.productCode"] = product_code
-        # # 检查是否为GPU实例并添加相应标签
-        # if any(key.startswith('nvidia.com/') for key in resource_limits):
-        #     labels[GPU_POD_LABEL_KEY] = GPU_POD_LABEL_VALUE
 
         return labels
-
-    def create_affinity(self, node_selector_gpu):
-        """创建亲和性配置"""
-        if not node_selector_gpu:
-            return None
-
-        return V1Affinity(
-            pod_affinity=V1PodAffinity(
-                preferred_during_scheduling_ignored_during_execution=[
-                    V1WeightedPodAffinityTerm(
-                        weight=100,
-                        pod_affinity_term=V1PodAffinityTerm(
-                            label_selector=V1LabelSelector(
-                                match_expressions=[
-                                    V1LabelSelectorRequirement(
-                                        key=GPU_POD_LABEL_KEY,
-                                        operator="In",
-                                        values=[GPU_POD_LABEL_VALUE]
-                                    )
-                                ]
-                            ),
-                            namespace_selector=None,
-                            topology_key="kubernetes.io/hostname"
-                        )
-                    )
-                ]
-            )
-        )
 
     def stop_ai_instance_by_id(self, id):
         try:
@@ -1384,7 +1512,7 @@ class AiInstanceService:
             ai_instance_info_db.instance_real_status = None
             AiInstanceSQL.update_ai_instance_info(ai_instance_info_db)
 
-            app_client = get_k8s_app_client(ai_instance_info_db.instance_k8s_id)
+            app_client = self.get_cached_app_client(ai_instance_info_db.instance_k8s_id)
             body = {"spec": {"replicas": 0}}
             try:
                 app_client.patch_namespaced_stateful_set(
@@ -1441,8 +1569,9 @@ class AiInstanceService:
                 image_name = SAVE_TO_IMAGE_CCI_PREFIX + id
                 # 异步保存关机镜像
                 self.async_save_cci_to_image(id, ai_instance_info_db,None, image_name, image_tag)
+                field = f"{image_name}:{image_tag}"
 
-                commit_push_image_flag = redis_connection.get_redis_by_key(SAVE_TO_IMAGE_CCI_PREFIX + id + "_flag")
+                commit_push_image_flag = redis_connection.hget(CCI_SAVE_TO_IMAGE_REDIS_KEY_PREFIX + id + "_flag", field)
                 dingo_print(f"ai instance[{id}] push image flag: {commit_push_image_flag}")
                 if commit_push_image_flag != "true":
                     error_msg =  f" ai instance[{id}] commit or push image image_tag: [{image_name}:{image_tag}] failed"
@@ -1450,7 +1579,7 @@ class AiInstanceService:
                     raise error_msg
 
 
-                app_client = get_k8s_app_client(ai_instance_info_db.instance_k8s_id)
+                app_client = self.get_cached_app_client(ai_instance_info_db.instance_k8s_id)
                 dingo_print(f"ai instance {id} start set replicas to 0")
                 body = {"spec": {"replicas": 0}}
                 try:
@@ -1557,6 +1686,7 @@ class AiInstanceService:
             pod_real_status = None
             pod_located_node_name = None
 
+            loop_count = 0
             while (datetime.now() - start_time).total_seconds() < timeout:
                 try:
                     # 查询 Pod 状态
@@ -1584,6 +1714,8 @@ class AiInstanceService:
                         # 明确退出函数
                         return
 
+                    loop_count += 1
+                    dingo_print(f"check Pod {pod_name} status loop {loop_count}, current status: {pod_real_status}, node name:{current_node_name}")
                     # check again after 5 seconds
                     time.sleep(5)
 
@@ -1594,10 +1726,17 @@ class AiInstanceService:
 
                     time.sleep(5)
 
+                # query ai_instance_db again
+                ai_instance_db = AiInstanceSQL.get_ai_instance_info_by_id(instance_id)
+                if not ai_instance_db:
+                    dingo_print(
+                        f"Pod {pod_name} instance id {ai_instance_db.id} not found in db, will exit check loop")
+                    return
+
             # 5. 检查是否超时
             if (datetime.now() - start_time).total_seconds() >= timeout:
-                dingo_print(f"Pod {pod_name} status check timeout (5 minutes), may need to change instance status to error")
-                raise Exception(f"start cci pod timeout {CCI_NAMESPACE_PREFIX}, change instance status to error")
+                dingo_print(f"Pod {pod_name} status check timeout (30 minutes), may need to change instance status to error")
+                raise Exception(f"start cci pod timeout {CCI_TIME_OUT_DEFAULT}, change instance status to error")
 
         except Exception as e:
             dingo_print(f"check pod {pod_name} status error: {e}")
@@ -1614,8 +1753,8 @@ class AiInstanceService:
 
     def exec_start_cci_operate(self, ai_instance_info_db, start_request):
         # 获取k8s客户端
-        app_k8s_client = get_k8s_app_client(ai_instance_info_db.instance_k8s_id)
-        core_k8s_client = get_k8s_core_client(ai_instance_info_db.instance_k8s_id)
+        app_k8s_client = self.get_cached_app_client(ai_instance_info_db.instance_k8s_id)
+        core_k8s_client = self.get_cached_core_client(ai_instance_info_db.instance_k8s_id)
         # 命名空间名称与实例名
         namespace_name = CCI_NAMESPACE_PREFIX + ai_instance_info_db.instance_tenant_id
         real_name = ai_instance_info_db.instance_real_name
@@ -1631,9 +1770,9 @@ class AiInstanceService:
         # 原sts 数据
         existing_sts = k8s_common_operate.read_sts_info(app_k8s_client, real_name, namespace_name)
         if start_request and start_request.instance_config:
-            resource_config = self._prepare_resource_config(start_request.instance_config)
+            resource_config = self._prepare_resource_config(start_request.instance_config, ai_instance_info_db.instance_k8s_id)
         else:
-            resource_config = self._prepare_resource_config(json.loads(ai_instance_info_db.instance_config))
+            resource_config = self._prepare_resource_config(json.loads(ai_instance_info_db.instance_config), ai_instance_info_db.instance_k8s_id)
         image_name_temp = SAVE_TO_IMAGE_CCI_PREFIX + ai_instance_info_db.id
         if start_request and start_request.image:
             image_name = start_request.image
@@ -1681,14 +1820,17 @@ class AiInstanceService:
         :param namespace: Pod 所在的命名空间
         :param timeout: 超时时间(秒), 默认30分钟(1800秒)
         """
-        try:
-            pod_real_status = ""
-            pod_located_node_name = ""
-            pod_name = ai_instance_db.instance_real_name + "-0"
-            namespace = CCI_NAMESPACE_PREFIX + ai_instance_db.instance_tenant_id
+        pod_real_status = ""
+        pod_located_node_name = ""
+        pod_name = ai_instance_db.instance_real_name + "-0"
+        namespace = CCI_NAMESPACE_PREFIX + ai_instance_db.instance_tenant_id
 
+        try:
             # 准备命名空间
             namespace_name = self._prepare_namespace(ai_instance)
+            # 保存租户信息到关系表
+            self.get_and_save_ai_instance_relation_tenant_info__by_k8s_tenant_id(ai_instance.k8s_id, ai_instance_db.instance_tenant_id)
+
             # 镜像全路径。格式:   域名/项目/镜像名+tag
             image_pull = ai_instance.image
             harbor_address = image_pull.split("/")[0]
@@ -1912,7 +2054,7 @@ class AiInstanceService:
             if not ai_instance_info_db:
                 raise Fail(f"ai instance[{id}] is not found", error_message=f" 容器实例[{id}找不到]")
 
-            core_k8s_client = get_k8s_core_client(ai_instance_info_db.instance_k8s_id)
+            core_k8s_client = self.get_cached_core_client(ai_instance_info_db.instance_k8s_id)
             namespace_name = CCI_NAMESPACE_PREFIX + ai_instance_info_db.instance_tenant_id
             service_name = ai_instance_info_db.instance_real_name
 
@@ -1961,7 +2103,7 @@ class AiInstanceService:
             if not ai_instance_info_db:
                 raise Fail(f"ai instance[{id}] is not found", error_message=f" cci instance [{id} not found]")
 
-            core_k8s_client = get_k8s_core_client(ai_instance_info_db.instance_k8s_id)
+            core_k8s_client = self.get_cached_core_client(ai_instance_info_db.instance_k8s_id)
             namespace_name = CCI_NAMESPACE_PREFIX + ai_instance_info_db.instance_tenant_id
             service_name = ai_instance_info_db.instance_real_name
 
@@ -2008,7 +2150,7 @@ class AiInstanceService:
                 dingo_print(f"list port by id {id} fail, not found")
                 raise Fail(f"ai instance[{id}] is not found", error_message=f" cci instance [{id} not found]")
 
-            core_k8s_client = get_k8s_core_client(ai_instance_info_db.instance_k8s_id)
+            core_k8s_client = self.get_cached_core_client(ai_instance_info_db.instance_k8s_id)
             namespace_name = CCI_NAMESPACE_PREFIX + ai_instance_info_db.instance_tenant_id
             service_name = ai_instance_info_db.instance_real_name or ai_instance_info_db.instance_name
 
@@ -2047,7 +2189,7 @@ class AiInstanceService:
                 dingo_print(f"get jupyter urls by id {id} fail, not found")
                 raise Fail(f"ai instance[{id}] is not found", error_message=f" cci instance [{id} not found]")
 
-            core_k8s_client = get_k8s_core_client(ai_instance_info_db.instance_k8s_id)
+            core_k8s_client = self.get_cached_core_client(ai_instance_info_db.instance_k8s_id)
             namespace_name = CCI_NAMESPACE_PREFIX + ai_instance_info_db.instance_tenant_id
             service_name = ai_instance_info_db.instance_real_name
 
@@ -2137,7 +2279,7 @@ class AiInstanceService:
                 dingo_print(f"get ssh info by id {id} fail, not found")
                 raise Fail(f"ai instance[{id}] is not found", error_message=f" cci instance [{id} not found]")
             # 连接k8s
-            core_k8s_client = get_k8s_core_client(ai_instance_info_db.instance_k8s_id)
+            core_k8s_client = self.get_cached_core_client(ai_instance_info_db.instance_k8s_id)
             namespace_name = CCI_NAMESPACE_PREFIX + ai_instance_info_db.instance_tenant_id
             service_name = ai_instance_info_db.instance_real_name
 
@@ -2362,7 +2504,7 @@ class AiInstanceService:
             raise Fail(f"ai instance[{id}] is not found", error_message=f" 容器实例[{id}找不到]")
 
         try:
-            core_client = get_k8s_core_client(ai_instance_db.instance_k8s_id)
+            core_client = self.get_cached_core_client(ai_instance_db.instance_k8s_id)
             # 创建k8s exec连接
             exec_command = [
                 '/bin/sh',
@@ -2417,7 +2559,7 @@ class AiInstanceService:
             return
         # 连接k8s，设置副本数0
         try:
-            app_client = get_k8s_app_client(instance_info_db.instance_k8s_id)
+            app_client = self.get_cached_app_client(instance_info_db.instance_k8s_id)
             body = {"spec": {"replicas": replica}}
             app_client.patch_namespaced_stateful_set(
                 name=instance_info_db.instance_real_name,
@@ -2647,3 +2789,46 @@ class AiInstanceService:
         for i in range(1, 1001):
             # 测试线程池
             queuedThreadPool.submit(partial(print, f"Hello World Number {i}"))
+
+
+    def get_large_capacity_storage_fs_shared_volume_path(self, tenant_id: str):
+        dingo_print(f"get_large_capacity_storage_fs_shared_volume_path tenant_id:{tenant_id}")
+        
+        custom_client = self.get_alayanew_cached_custom_client("alayanew_k8s_kubeconfig_key")
+        if custom_client:
+            dingo_print(f"get_large_capacity_storage_fs_shared_volume_path get custom_client success, tenant_id:{tenant_id}")
+            
+            alayanew_share_volume = k8s_common_operate.get_alayanew_share_volume(custom_client, tenant_id)
+
+            if alayanew_share_volume:
+                # 安全地获取长度，alayanew_share_volume可能是字典类型
+                volume_info = alayanew_share_volume if isinstance(alayanew_share_volume, dict) else {}
+                dingo_print(f"get_large_capacity_storage_fs_shared_volume_path volume_path found, tenant_id:{tenant_id}, volume_keys:{list(volume_info.keys()) if volume_info else 'unknown'}")
+                
+                # 根据对象类型使用不同的访问方式
+                if isinstance(alayanew_share_volume, dict):
+                    # 如果是字典，直接使用字典访问
+                    spec = alayanew_share_volume.get('spec')
+                    if spec:
+                        volume_path = spec.get('fsSharedVolumePath') if isinstance(spec, dict) else getattr(spec, 'fsSharedVolumePath', None)
+                        dingo_print(f"get_large_capacity_storage_fs_shared_volume_path volume_path:{volume_path}")
+                        return volume_path
+                else:
+                    # 如果是对象，使用getattr访问
+                    if hasattr(alayanew_share_volume, 'spec'):
+                        spec = getattr(alayanew_share_volume, 'spec', None)
+                        if spec:
+                            volume_path = spec.get('fsSharedVolumePath') if hasattr(spec, 'get') else getattr(spec, 'fsSharedVolumePath', None)
+                            dingo_print(f"get_large_capacity_storage_fs_shared_volume_path volume_path:{volume_path}")
+                            return volume_path
+
+        dingo_print(f"get_large_capacity_storage_fs_shared_volume_path is empty, tenant_id:{tenant_id}")
+
+        return None
+
+    def get_and_save_ai_instance_relation_tenant_info__by_k8s_tenant_id(self, k8s_id, tennat_id):
+        ai_instance_relation_tenant_info_db = AiInstanceSQL.get_ai_instance_relation_tenant_info_by_tenant_id(k8s_id, tennat_id)
+        if not ai_instance_relation_tenant_info_db:
+            # 保存关联信息
+            AiInstanceSQL.save_ai_instance_relation_tenant_info(AiInstanceRelationTenantInfo(k8s_id=k8s_id, tenant_id=tennat_id))
+

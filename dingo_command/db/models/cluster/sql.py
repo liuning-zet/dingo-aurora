@@ -94,7 +94,7 @@ class ClusterSQL:
         # session = Session()
         session = get_session()
         with session.begin():
-            session.merge(cluster)
+            return session.merge(cluster)
 
     @classmethod
     def delete_cluster(cls, catalog, name):

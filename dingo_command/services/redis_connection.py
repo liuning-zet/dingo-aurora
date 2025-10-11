@@ -12,6 +12,9 @@ REDIS_PORT = CONF.redis.redis_port
 REDIS_PASSWORD = CONF.redis.redis_password
 SENTINEL_URL = CONF.redis.sentinel_url
 
+REDIS_DINGO_COMMAND_KEY_PREFIX = "dingo_command"
+CCI_SAVE_TO_IMAGE_REDIS_KEY_PREFIX = f"{REDIS_DINGO_COMMAND_KEY_PREFIX}:cci_save_to_image:"
+
 # Redis连接工具
 class RedisConnection:
 
@@ -118,6 +121,72 @@ class RedisConnection:
         except Exception as e:
             print(f"Redis delete operation failed: {e}")
             return False
+
+# =============  以下为redis hash操作  ==================
+
+    def hset_with_expire(self, redis_key: str, field: str, value, expire_seconds: int):
+        """
+        设置哈希表字段的值，并对整个哈希 key 设置过期时间
+        """
+        if not redis_key or not field or expire_seconds <= 0:
+            return
+        self.redis_master_connection.hset(redis_key, field, value)
+        # 设置过期时间
+        self.redis_master_connection.expire(redis_key, expire_seconds)
+
+    def hset(self, redis_key: str, field: str, value):
+        """
+        设置哈希表字段的值
+        """
+        if not redis_key or not field:
+            return 0
+        return self.redis_master_connection.hset(redis_key, field, value)
+
+    def hget(self, redis_key: str, field: str):
+        """
+        获取哈希表字段的值
+        """
+        if not redis_key or not field:
+            return None
+        return self.redis_master_connection.hget(redis_key, field)
+
+    def hget_all(self, redis_key: str):
+        """
+        获取哈希表所有字段和值
+        :return:
+            - None: Key 不存在
+            - {}: Key 存在但无字段
+            - dict: 字段和值（如 {'field1': 'value1'}）
+        """
+        if not redis_key:
+            return None
+        if not self.redis_master_connection.exists(redis_key):
+            return None
+        return self.redis_master_connection.hgetall(redis_key)
+
+    def hdel(self, redis_key: str, field: str):
+        """
+        删除哈希表字段
+        """
+        if not redis_key or not field:
+            return 0
+        return self.redis_master_connection.hdel(redis_key, field)
+
+    def hdel_all_fields(self, redis_key: str) -> int:
+        """
+        删除哈希表的所有字段（保留 Key 本身）
+        :return: 删除的字段数量
+        """
+        if not redis_key:
+            return 0
+        # 获取所有字段名
+        fields = self.redis_master_connection.hkeys(redis_key)
+        if not fields:
+            return 0
+        # 批量删除字段
+        return self.redis_master_connection.hdel(redis_key, *fields)
+
+# =============  以上为redis hash操作  ==================
 
 # 声明redis的连接工具
 redis_connection = RedisConnection()

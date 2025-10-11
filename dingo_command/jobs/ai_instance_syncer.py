@@ -118,10 +118,19 @@ def sync_single_k8s_cluster(k8s_id: str, core_client, apps_client, networking_cl
 
         # 2. 按namespace分组处理
         tenant_id_list = [instance.instance_tenant_id for instance in db_instances if instance.instance_tenant_id]
+        tenant_id_list = list(set(tenant_id_list))
         dingo_print(f"fetch_ai_instance_info k8s {k8s_id} need handle namespace size: {len(tenant_id_list)}")
 
+        # 保存不存在的租户ID
+        AiInstanceSQL.save_non_existent_tenant_ids_simple(k8s_id, tenant_id_list)
+        # query all tenant_id in db for this k8s_id
+        all_tenant_id_in_db = AiInstanceSQL.list_ai_instance_relation_tenant_info_by_k8s_id(k8s_id)
+        if not all_tenant_id_in_db:
+            dingo_print(f"fetch_ai_instance_info k8s {k8s_id} not found any tenant_id in db, return")
+            return
+
         # 3. 逐个namespace处理
-        for tenant_id in tenant_id_list:
+        for tenant_id in all_tenant_id_in_db:
             try:
                 process_namespace_resources(
                     tenant_id=tenant_id,
@@ -591,12 +600,3 @@ def extract_image_info(sts):
     primary_container = sts.spec.template.spec.containers[0]
     return primary_container.image
 
-# def determine_instance_real_status(sts, pod):
-#     """根据K8s资源确定实例状态"""
-#     if not pod:
-#         return "STOPPED"
-#
-#     if sts.status.replicas == 0:
-#         return "STOPPED"
-#
-#     return pod.status.phase

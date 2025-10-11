@@ -112,7 +112,7 @@ def query_database_nodes(args):
         with session.begin():
             # 查询所有状态为 running 的节点
             nodes = session.query(NodeInfo).filter(
-                NodeInfo.status == 'joining',
+                # NodeInfo.status == 'joining',
                 NodeInfo.cluster_id == cluster_name # 只查询虚拟机类型的节点
             ).all()
             #print(f" querying database nodes: {nodes[0].admin_address}")

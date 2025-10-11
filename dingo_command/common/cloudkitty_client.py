@@ -105,7 +105,7 @@ class CloudKittyClient:
 
         return wrapper
 
-    def get_service_endpoint(self, service_type, interface='public', region='RegionOne'):
+    def get_service_endpoint(self, service_type, interface='internal', region='RegionOne'):
         """根据服务类型获取Endpoint"""
         for service in self._service_catalog:
             if service['type'] == service_type:

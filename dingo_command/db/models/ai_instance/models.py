@@ -1,6 +1,9 @@
 # 数据表对应的model对象
 
 from __future__ import annotations
+
+import uuid
+
 from sqlalchemy import Column, String, DateTime, Text, Boolean, text, Integer
 from sqlalchemy.orm import declarative_base
 
@@ -22,6 +25,7 @@ class AiK8sConfigs(Base):
     harbor_username = Column(String(length=128), nullable=True)
     harbor_password = Column(String(length=128), nullable=True)
     cpu_overcommit_ratio = Column(String(length=128), nullable=True)
+    gpu_relation_ib_device = Column(String(length=255), nullable=True)
     create_time = Column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
     update_time = Column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"))
 
@@ -106,3 +110,12 @@ class AiInstanceGpuCardInfo(Base):
     gpu_node_label = Column(String(length=255), nullable=True, comment="Node上GPU卡标签")
     gpu_key = Column(String(length=255), nullable=True, comment="Pod可使用的GPU key值")
     update_time = Column(DateTime, nullable=True, server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"), comment="更新时间")
+
+class AiInstanceRelationTenantInfo(Base):
+    __tablename__ = "ops_ai_instance_relation_tenant_info"
+
+    id = Column(String(length=128), primary_key=True, nullable=False, index=True, unique=True, default=lambda: str(uuid.uuid4()))
+    k8s_id = Column(String(length=128), nullable=True, comment="ai instance k8s id")
+    tenant_id = Column(String(length=128), nullable=True, comment="ai instance 租户ID")
+    update_time = Column(DateTime, nullable=True, server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"), comment="更新时间")
+

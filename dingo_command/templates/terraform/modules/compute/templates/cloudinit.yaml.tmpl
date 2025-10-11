@@ -165,7 +165,7 @@ write_files:
       echo -e "\n安装完成！node_exporter 已成功安装并运行。"
       echo "访问地址: http://$(hostname -I | awk '{print $1}'):9100/metrics"
 runcmd:
-  - /bin/bash /opt/install_node_exporter.sh > /opt/install.log
+  #- /bin/bash /opt/install_node_exporter.sh > /opt/install.log
   - sed -i 's/^.*GSSAPIAuthentication.*$/GSSAPIAuthentication no/' /etc/ssh/sshd_config || echo "GSSAPIAuthentication no" >> /etc/ssh/sshd_config
   - sed -i 's/^.*GSSAPIAuthentication.*$/GSSAPIAuthentication no/' /etc/ssh/sshd_config.d/50-redhat.conf || echo "GSSAPIAuthentication no" >> /etc/ssh/sshd_config.d/50-redhat.conf
   - sed -i 's/^.*GSSAPIAuthentication.*$/GSSAPIAuthentication no/' /etc/ssh/sshd_config.d/50-cloud-init.conf || echo "GSSAPIAuthentication no" >> /etc/ssh/sshd_config.d/50-cloud-init.conf

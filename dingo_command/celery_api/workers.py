@@ -9,6 +9,7 @@ import subprocess
 import time
 import copy
 import uuid
+import string
 import yaml
 from typing import Dict, Optional, List, Any
 from dingo_command.api.model.cluster import ClusterObject
@@ -356,6 +357,7 @@ def create_infrastructure(cluster:ClusterTFVarsObject, task_info:Taskinfo, scale
              subnet_id, bussubnet_id) = get_networks(cluster, task_info, host_file, cluster_dir)
             db_cluster.admin_network_id = network_id
             db_cluster.admin_subnet_id = subnet_id
+            
             db_cluster.bus_network_id = bus_network_id
             db_cluster.bus_subnet_id = bussubnet_id
             db_cluster.private_key = private_key_content
@@ -365,6 +367,11 @@ def create_infrastructure(cluster:ClusterTFVarsObject, task_info:Taskinfo, scale
 
             if cluster.use_existing_network:
                 db_cluster.admin_subnet_id = cluster.admin_subnet_id
+
+            else:
+                cluster.admin_subnet_id = subnet_id
+                cluster.admin_network_id = network_id
+
 
             if bussubnet_id != "":
                 neutron_api = neutron.API()
@@ -548,7 +555,8 @@ def deploy_kubernetes(cluster: ClusterObject, cluster_tf: ClusterTFVarsObject, l
             "external_openstack_lbaas_enabled": True,
             "external_openstack_lbaas_floating_network_id": cluster_tf.external_net,
             "external_openstack_lbaas_floating_subnet_id": cluster_tf.external_subnetids[0],
-            #"external_openstack_lbaas_subnet_ids": cluster.network_config.admin_subnet_id,
+            "external_openstack_lbaas_subnet_ids": cluster_tf.admin_subnet_id,
+            "external_openstack_lbaas_network_id": cluster_tf.admin_network_id
         }
         target_dir = os.path.join(WORK_DIR, "ansible-deploy", "inventory", str(cluster.id), "group_vars", "all")
         os.makedirs(target_dir, exist_ok=True)
@@ -591,7 +599,7 @@ def deploy_kubernetes(cluster: ClusterObject, cluster_tf: ClusterTFVarsObject, l
                 private_key_content = key_file.read()
         
         print(f"start deploy kubernetes cluster: {str(cluster.id)}")
-        thread, runner = run_playbook(playbook_file, host_file, ansible_dir, ssh_key=private_key_content, netns=netns)
+        thread, runner = run_playbook(playbook_file, host_file, ansible_dir, ssh_key=private_key_content, netns=netns, cluster_id=str(cluster.id))
         # 处理并打印事件日志
         runtime_bool = False
         etcd_bool = False
@@ -754,8 +762,9 @@ def scale_kubernetes(cluster_id, scale_nodes, task_id, netns: str = None, app_cr
             target_dir = os.path.join(WORK_DIR, "ansible-deploy", "inventory", str(cluster_id), "group_vars", "k8s_cluster")
             cluster_file = os.path.join(target_dir, "k8s-cluster.yml")
             subprocess.run(["sed", "-i", "s/skip_download:.*/skip_download: true/", cluster_file], check=True)
+        print(f"start scale kubernetes cluster: {str(cluster_id)} with nodes: {scale_nodes} netns: {netns}")
         thread, runner = run_playbook(playbook_file, host_file, ansible_dir,
-                                      ssh_key=private_key_content, limit=scale_nodes,  netns=netns)
+                                      ssh_key=private_key_content, limit=scale_nodes,  netns=netns, cluster_id=cluster_id)
         # 处理并打印事件日志
         runtime_bool = False
         etcd_bool = False
@@ -768,7 +777,7 @@ def scale_kubernetes(cluster_id, scale_nodes, task_id, netns: str = None, app_cr
                     task_name = event['event_data'].get('task')
                     host = event['event_data'].get('host')
                     task_status = event['event'].split('_')[-1]  # 例如 runner_on_ok -> ok
-                    # print(f"任务 {task_name} 在主机 {host} 上 Status: {event['event']}")
+                    print(f"任务 {task_name} 在主机 {host} 上 Status: {event['event']}")
                     # print(f"task_name is: {task_name}")
                     if task_name == scale_download_images and host is not None:
                         if not runtime_bool:
@@ -1190,7 +1199,6 @@ def remove_bastion_fip_from_state(cluster_dir):
             
             print(f"rm bastion_fip from terraform state ")
             return True
-
         elif "module.network.openstack_networking_router_v2.cluster[0]" in state_resources:
             # 执行 terraform state rm 移除资源
             remove_result = subprocess.run(
@@ -1200,6 +1208,28 @@ def remove_bastion_fip_from_state(cluster_dir):
                 check=True
             )
             print(f"rm cluster_router from terraform state ")
+            return True
+        elif "module.network.openstack_networking_router_interface_v2.cluster_interface[0]" in state_resources:
+            # 执行 terraform state rm 移除资源
+            remove_result = subprocess.run(
+                ["terraform", "state", "rm",
+                 "module.network.openstack_networking_router_interface_v2.cluster_interface[0]"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            print(f"rm cluster_interface from terraform state ")
+            return True
+        elif "module.network.openstack_networking_router_interface_v2.cluster_interface_n[0]" in state_resources:
+            # 执行 terraform state rm 移除资源
+            remove_result = subprocess.run(
+                ["terraform", "state", "rm",
+                 "module.network.openstack_networking_router_interface_v2.cluster_interface_n[0]"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            print(f"rm cluster_interface_n from terraform state ")
             return True
         else:
             print(f"resource {target_resource} not exist in state ")
@@ -1510,7 +1540,9 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
             for gpu_count_info in instances_gpu_count_info:
                 if gpu_count_info.resource_gpu_count is not None:
                     c.gpu = gpu_count_info.resource_gpu_count + c.gpu
-        ClusterSQL.update_cluster(c)
+        print(f"start update cluster status {res}")
+        res = ClusterSQL.update_cluster(c)
+        print(f"update cluster status to running {res}")
         results = install_app_chart(cluster.charts, cluster_dict["id"])
         print("results is:", results)
 
@@ -2018,7 +2050,7 @@ def delete_node(self, cluster_id, cluster_name, node_list, instance_list, extrav
                 with open(key_file_path, 'r') as key_file:
                     private_key_content = key_file.read()
             thread, runner = run_playbook(playbook_file, host_file, ansible_dir,
-                                          ssh_key=private_key_content, extravars=extravars,  netns=netns)
+                                          ssh_key=private_key_content, extravars=extravars,  netns=netns, cluster_id=cluster_id)
             # 处理并打印事件日志
             runtime_bool = False
             etcd_bool = False
@@ -2097,6 +2129,41 @@ def delete_node(self, cluster_id, cluster_name, node_list, instance_list, extrav
                 task_info.detail = "Ansible remove node failed, please check log"
                 update_task_state(task_info)
                 raise Exception(f"Ansible remove node failed, please check log")
+            if not runtime_bool and not etcd_bool and not controller_bool and not worker_bool:
+                runtime_task.end_time = datetime.fromtimestamp(datetime.now().timestamp())
+                runtime_task.state = "success"
+                runtime_task.detail = TaskService.TaskDetail.remove_pre_install.value
+                update_task_state(runtime_task)
+                etcd_task = Taskinfo(task_id=task_id, cluster_id=cluster_id, state="progress",
+                                     start_time=datetime.fromtimestamp(datetime.now().timestamp()),
+                                     msg=TaskService.TaskRemoveNodeMessage.remove_from_cluster.name)
+                TaskSQL.insert(etcd_task)
+                etcd_task.end_time = datetime.fromtimestamp(datetime.now().timestamp())
+                etcd_task.state = "success"
+                etcd_task.detail = TaskService.TaskDetail.remove_from_cluster.value
+                update_task_state(etcd_task)
+                # 写入下一个任务
+                control_plane_task = Taskinfo(task_id=task_id, cluster_id=cluster_id, state="progress",
+                                              start_time=datetime.fromtimestamp(datetime.now().timestamp()),
+                                              msg=TaskService.TaskRemoveNodeMessage.remove_cri_pods.name)
+                TaskSQL.insert(control_plane_task)
+                control_plane_task.end_time = datetime.fromtimestamp(datetime.now().timestamp())
+                control_plane_task.state = "success"
+                control_plane_task.detail = TaskService.TaskDetail.remove_cri_pods.value
+                update_task_state(control_plane_task)
+                # 写入下一个任务
+                worker_task = Taskinfo(task_id=task_id, cluster_id=cluster_id, state="progress",
+                                       start_time=datetime.fromtimestamp(datetime.now().timestamp()),
+                                       msg=TaskService.TaskRemoveNodeMessage.remove_iptables.name)
+                TaskSQL.insert(worker_task)
+                worker_task.end_time = datetime.fromtimestamp(datetime.now().timestamp())
+                worker_task.state = "success"
+                worker_task.detail = TaskService.TaskDetail.remove_iptables.value
+                update_task_state(worker_task)
+                component_task = Taskinfo(task_id=task_id, cluster_id=cluster_id, state="progress",
+                                          start_time=datetime.fromtimestamp(datetime.now().timestamp()),
+                                          msg=TaskService.TaskRemoveNodeMessage.remove_file_dirs.name)
+                TaskSQL.insert(component_task)
 
         # # 2、执行完删除k8s这些节点之后，再执行terraform销毁这些节点（这里是单独修改output.json文件还是需要通过之前生成的output.json文件生成）
         # 在这里添加需要排除重新创建的虚拟机，从output文件里面取得nodes再和数据库里面的nodes做比较，数据里面没有的就在state删除
@@ -2144,8 +2211,8 @@ def delete_node(self, cluster_id, cluster_name, node_list, instance_list, extrav
 
         # 3、然后需要更新node节点的数据库的信息和集群的数据库信息
         # 更新集群cluster的状态为running，删除缩容节点的数据库信息
-        if cluster_tfvars and hosts_data and master_ip:
-            remove_node_exporter(cluster_tfvars, node_list, hosts_data, master_ip, cluster_dir, netns)
+        # if cluster_tfvars and hosts_data and master_ip:
+        #     remove_node_exporter(cluster_tfvars, node_list, hosts_data, master_ip, cluster_dir, netns)
         component_task.end_time = datetime.fromtimestamp(datetime.now().timestamp())
         component_task.state = "success"
         component_task.detail = TaskService.TaskDetail.remove_file_dirs.value
@@ -2476,18 +2543,19 @@ def delete_instance(self, openstack_info, instance):
         raise ValueError(e)
 
 @celery_app.task(bind=True,time_limit=TASK_TIMEOUT, soft_time_limit=SOFT_TASK_TIMEOUT)
-def add_existing_nodes(self, cluster_id, server_details, user, private_key: str = "", password: str = ""):
+def add_existing_nodes(self, cluster_id, cluster_name, server_details, user, private_key: str = "", password: str = "",
+                       network_id: str = ""):
     """将已有的虚拟机节点添加到K8s集群中"""
     try:
         task_id = str(self.request.id)
-        
+        update_task_info(task_id, cluster_id, cluster_name)
         # 1. 创建任务记录
         task_info = Taskinfo(
             task_id=task_id, 
             cluster_id=cluster_id, 
             state="progress",
             start_time=datetime.fromtimestamp(datetime.now().timestamp()),
-            msg="开始添加已有节点到集群"
+            msg=TaskService.TaskScaleNodeMessage.scale_instructure.name
         )
         TaskSQL.insert(task_info)
         
@@ -2511,37 +2579,31 @@ def add_existing_nodes(self, cluster_id, server_details, user, private_key: str 
         with session.begin():
             for i, server_detail in enumerate(server_details):
                 
-                # 获取 base64 编码的 user_data
-                user_data_b64 = server_detail.get("OS-EXT-SRV-ATTR:user_data")
-                if not user_data_b64:
-                    return None
-
-                # 解码
-                user_data = base64.b64decode(user_data_b64).decode("utf-8")
-                user_pass = ""
-                # 正则提取 passwd 脚本内容
-                passwd_script = re.search(r"#!/bin/sh\s*echo\s+'([^']+)' \| chpasswd", user_data)
-                if passwd_script:
-                    user_pass = passwd_script.group(1)
-                if user_pass:
-                    username, password = user_pass.split(":", 1)
-                
                 # 创建Node记录
+                #生成4位随机字符串
+                # 生成4位随机字符串
+                def generate_random_string():
+                    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+
                 node_db = NodeInfo()
                 node_db.id = str(uuid.uuid4())
+                # 设置 node_db.name
+                node_db.name = f"{cluster_name}-existed-node-{generate_random_string()}"
+
                 node_db.cluster_id = cluster_id
                 node_db.server_id = server_detail.get("id")
                 node_db.cluster_name = cluster_name
-                node_db.name = f"{cluster_name}-existing-node-{i+1}"
+                
                 node_db.role = "worker"  # 默认作为worker节点
                 node_db.status = "joining"
                 node_db.cpu = server_detail.get("flavor", {}).get("vcpus", 0)
-                node_db.mem = server_detail.get("flavor", {}).get("ram", 0) // 1024  # MB转GB
+                node_db.mem = server_detail.get("flavor", {}).get("ram", 0)  # MB转GB
                 node_db.disk = server_detail.get("flavor", {}).get("disk", 0)
                 node_db.gpu = 0  # 默认为0，可根据需要扩展
                 node_db.region = cluster_db.region_name
                 node_db.password = password
-                node_db.user = username
+                node_db.user = user
+                node_db.private_key = private_key
                 node_db.create_time = datetime.now()
                 node_db.update_time = datetime.now()
                 node_db.node_type = "vm"
@@ -2551,8 +2613,8 @@ def add_existing_nodes(self, cluster_id, server_details, user, private_key: str 
                     if isinstance(ips, list) and ips:
                         admin_address = ips[0].get("addr")
                 node_db.admin_address = admin_address
-                node_db.image = server_detail.get("image", {}).get("id", "")
-                session.add(node_db)
+                node_db.image = server_detail.get("image", {}).get("id", "") if isinstance(server_detail.get("image", {}), dict) else ""
+
                 
                 # 创建Instance记录
                 instance_db = Instance()
@@ -2560,18 +2622,24 @@ def add_existing_nodes(self, cluster_id, server_details, user, private_key: str 
                 instance_db.cluster_id = cluster_id
                 instance_db.server_id = server_detail.get("id")
                 instance_db.cluster_name = cluster_name
-                instance_db.name = server_detail.get("name", f"existing-server-{i+1}")
+                instance_db.name = node_db.name
                 instance_db.server_id = server_detail.get("id")
                 instance_db.node_type = "vm"
                 instance_db.status = "joining"
+                instance_db.private_key = private_key
                 instance_db.region = cluster_db.region_name
+                instance_db.user = user
+                instance_db.password = password
                 instance_db.flavor_id = server_detail.get("flavor", {}).get("id", "")
-                instance_db.image_id = server_detail.get("image", {}).get("id", "")
+                instance_db.image_id = server_detail.get("image", {}).get("id", "") if isinstance(server_detail.get("image", {}), dict) else ""
                 instance_db.create_time = datetime.now()
                 instance_db.update_time = datetime.now()
+                node_db.instance_id = instance_db.id
+                session.add(node_db)
                 session.add(instance_db)
                 
                 node_instances.append({
+                    "name": node_db.name,
                     "node": node_db,
                     "instance": instance_db,
                     "server_detail": server_detail
@@ -2604,16 +2672,33 @@ def add_existing_nodes(self, cluster_id, server_details, user, private_key: str 
                     break
                     
             if ip_address:
-                node_names.append(f"{cluster_db.name}-existing-node-{index}:{ip_address}")
+                node_names.append(f"{ni['name']}:{ip_address}")
                 index += 1
 
         # 8. 执行Ansible扩容
         if node_names:
+            time.sleep(2)
+            task_info.end_time = datetime.fromtimestamp(datetime.now().timestamp())
+            task_info.state = "success"
+            task_info.detail = "check infrastructure successfully"
+            update_task_state(task_info)
+            task_info = Taskinfo(task_id=task_id, cluster_id=cluster_id, state="progress",
+                                 start_time=datetime.fromtimestamp(datetime.now().timestamp()),
+                                 msg=TaskService.TaskScaleNodeMessage.scale_pre_install.name)
+            TaskSQL.insert(task_info)
+            time.sleep(3)
+            task_info.end_time = datetime.fromtimestamp(datetime.now().timestamp())
+            task_info.state = "success"
+            task_info.detail = "install prepare success"
+            update_task_state(task_info)
             os.environ['CURRENT_CLUSTER_DIR']=cluster_dir
             scale_nodes = ",".join([name.split(":")[0] for name in node_names])
-            print("准备扩容的节点: %s", scale_nodes)
-            ansible_result = scale_kubernetes(cluster_id, scale_nodes, task_id, download_enabled=True)
-            
+            print("准备扩容的节点: ", scale_nodes)
+            netns = ""
+            if network_id and network_id != "":
+                netns = "qdhcp-" + network_id
+            ansible_result = scale_kubernetes(cluster_id, scale_nodes, task_id, netns=netns, download_enabled=True)
+
             if not ansible_result[0]:
                 raise Exception(f"Ansible 扩容失败: {ansible_result[1]}")
         
@@ -2642,12 +2727,6 @@ def add_existing_nodes(self, cluster_id, server_details, user, private_key: str 
                     cluster.mem += ni["node"].mem
                     cluster.gpu += ni["node"].gpu
         
-        # 11. 更新任务状态为成功
-        task_info.end_time = datetime.fromtimestamp(datetime.now().timestamp())
-        task_info.state = "success"
-        task_info.detail = f"成功添加 {len(server_details)} 个节点到集群"
-        update_task_state(task_info)
-        
         return True
         
     except SoftTimeLimitExceeded:
@@ -2664,13 +2743,6 @@ def add_existing_nodes(self, cluster_id, server_details, user, private_key: str 
     except Exception as e:
         # 处理错误
         print(f"添加已有节点错误: {str(e)}")
-        
-        # 更新任务状态为失败
-        if 'task_info' in locals():
-            task_info.end_time = datetime.fromtimestamp(datetime.now().timestamp())
-            task_info.state = "failed"
-            task_info.detail = f"添加节点失败: {str(e)}"
-            update_task_state(task_info)
         
         # 更新集群状态
         query_params = {"id": cluster_id}

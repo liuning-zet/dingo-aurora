@@ -224,6 +224,7 @@ async def add_node(cluster_id:str, servers: List[ExistingNodeObject], token: str
             raise HTTPException(status_code=400, detail="the cluster is removing, please wait")
         
         # 通过server_ids查询虚拟机信息
+        network_id = ""
         server_details = []
         for server in servers:
             try:
@@ -234,7 +235,8 @@ async def add_node(cluster_id:str, servers: List[ExistingNodeObject], token: str
                     raise HTTPException(status_code=400, detail=f"Server {server.id} not found")
                 if not server_detail.get("addresses"):
                     raise HTTPException(status_code=400, detail=f"Server {server.id} has no networks")
-                network_addresses = server_detail["addresses"][result.network_config.admin_network_name]
+                network_name = list(server_detail["addresses"].keys())[0]
+                network_addresses = server_detail["addresses"][network_name]
                 if not network_addresses:
                     raise HTTPException(status_code=400, detail=f"Server {server.id} has no IP in the matching network")
                 node_ip = network_addresses[0]["addr"]  # 假设 IP 在 "addr" 字段
@@ -248,10 +250,20 @@ async def add_node(cluster_id:str, servers: List[ExistingNodeObject], token: str
                 import subprocess
                 cmd = []
                 if server.private_key and server.private_key != "":
-                    # 使用私钥
+                    
+                    private_key_dir = os.path.join("/tmp", str(cluster_id))
+                    # Create the directory if it doesn't exist
+                    os.makedirs(private_key_dir, exist_ok=True)
+                    import re
+                    server.private_key = re.sub(r'\r\n?', '\n', server.private_key).strip() + '\n'
+                    # Define the full path for the private key file
+                    private_key_path = os.path.join(private_key_dir, "private_key.pem")
+                    with open(private_key_path, "w",newline='\n', encoding='utf-8') as f:
+                        f.write(server.private_key)
+                    os.chmod(private_key_path, 0o600)
                     cmd = [
                         "ssh",
-                        "-i", server.private_key,
+                        "-i", private_key_path,
                         "-o", "StrictHostKeyChecking=no",
                         "-o", "ConnectTimeout=10",
                         f"{server.user}@{node_ip}",
@@ -265,6 +277,7 @@ async def add_node(cluster_id:str, servers: List[ExistingNodeObject], token: str
                         "ssh",
                         "-o", "StrictHostKeyChecking=no",
                         "-o", "ConnectTimeout=10",
+                        "-o", "PreferredAuthentications=password",
                         f"{server.user}@{node_ip}",
                         "echo 'SSH connection successful'"
                     ]
@@ -272,13 +285,16 @@ async def add_node(cluster_id:str, servers: List[ExistingNodeObject], token: str
                     cmd = ["ip", "netns", "exec", netns] + cmd
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
                 if result.returncode != 0:
+                    print(f"Command failed with return code {cmd}")
+                    print(result.stderr)
                     raise Exception(f"SSH connection failed: {result.stderr}")
-                server_details.append(server_detail)
+                server_details.append(dict(server_detail))
             except Exception as e:
+                traceback.print_exc()
                 raise HTTPException(status_code=400, detail=f"Failed to get server {server.id} details: {str(e)}")
         
         # 调用添加节点的服务方法
-        result = cluster_service.add_existing_nodes_to_cluster(cluster_id, server_details, token, private_key=server.private_key, user=server.user, password=server.password)
+        result = cluster_service.add_existing_nodes_to_cluster(cluster_id, server_details, token, private_key=server.private_key, user=server.user, password=server.password, network_id=network_id)
 
         return result
         
