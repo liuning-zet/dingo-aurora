@@ -1439,6 +1439,7 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
         query_params["id"] = cluster_dict["id"]
         count, db_clusters = ClusterSQL.list_cluster(query_params)
         c = db_clusters[0]
+        cluster_pre_status = c.status
         c.status = 'running'
         c.status_msg = ""
         if not scale:
@@ -1453,9 +1454,9 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
             for gpu_count_info in instances_gpu_count_info:
                 if gpu_count_info.resource_gpu_count is not None:
                     c.gpu = gpu_count_info.resource_gpu_count + c.gpu
-        print(f"start update cluster status {res}")
+        print(f"start update cluster status {cluster_pre_status}")
         res = ClusterSQL.update_cluster(c)
-        print(f"update cluster status to running {res}")
+        print(f"update cluster status to running {res.status}")
         results = install_app_chart(cluster.charts, cluster_dict["id"])
         print("results is:", results)
 
