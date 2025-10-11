@@ -1,0 +1,279 @@
+---
+# Set to true to allow pre-checks to fail and continue deployment
+ignore_assert_errors: false
+# Set to false to disable the backup parameter, set to true to accumulate backups of config files.
+leave_etc_backup_files: true
+nameservers: []
+cloud_resolver: []
+disable_host_nameservers: false
+epel_enabled: false
+# Kubespray sets this to true after clusterDNS is running to apply changes to the host resolv.conf
+dns_late: false
+
+containerd_storage_dir: "/var/lib/containerd"
+containerd_state_dir: "/run/containerd"
+containerd_systemd_dir: "/etc/systemd/system/containerd.service.d"
+# The default value is not -999 here because containerd's oom_score_adj has been
+# set to the -999 even if containerd_oom_score is 0.
+# Ref: https://github.com/kubernetes-sigs/kubespray/pull/9275#issuecomment-1246499242
+containerd_oom_score: 0
+
+containerd_default_runtime: "runc"
+containerd_snapshotter: "overlayfs"
+
+containerd_runc_runtime:
+  name: runc
+  type: "io.containerd.runc.v2"
+  engine: ""
+  root: ""
+  base_runtime_spec: cri-base.json
+  options:
+    systemdCgroup: "{{ containerd_use_systemd_cgroup | ternary('true', 'false') }}"
+    binaryName: "{{ bin_dir }}/runc"
+
+containerd_additional_runtimes: []
+# Example for Kata Containers as additional runtime:
+#  - name: kata
+#    type: "io.containerd.kata.v2"
+#    engine: ""
+#    root: ""
+
+containerd_base_runtime_spec_rlimit_nofile: 65535
+
+containerd_default_base_runtime_spec_patch:
+  process:
+    rlimits:
+      - type: RLIMIT_NOFILE
+        hard: "{{ containerd_base_runtime_spec_rlimit_nofile }}"
+        soft: "{{ containerd_base_runtime_spec_rlimit_nofile }}"
+
+# Can help reduce disk usage
+# https://github.com/containerd/containerd/discussions/6295
+containerd_discard_unpacked_layers: true
+
+containerd_base_runtime_specs:
+  cri-base.json: "{{ containerd_default_base_runtime_spec | combine(containerd_default_base_runtime_spec_patch, recursive=1) }}"
+
+containerd_grpc_max_recv_message_size: 16777216
+containerd_grpc_max_send_message_size: 16777216
+
+containerd_debug_address: ""
+containerd_debug_level: "info"
+containerd_debug_format: ""
+containerd_debug_uid: 0
+containerd_debug_gid: 0
+
+containerd_metrics_address: ""
+
+containerd_metrics_grpc_histogram: false
+
+containerd_registries_mirrors:
+  - prefix: docker.io
+    mirrors:
+      - host: https://registry-1.docker.io
+        capabilities: ["pull", "resolve"]
+        skip_verify: false
+#        ca: ["/etc/certs/mirror.pem"]
+#        client: [["/etc/certs/client.pem", ""],["/etc/certs/client.cert", "/etc/certs/client.key"]]
+
+containerd_max_container_log_line_size: 16384
+
+# If enabled it will allow non root users to use port numbers <1024
+containerd_enable_unprivileged_ports: false
+# If enabled it will allow non root users to use icmp sockets
+containerd_enable_unprivileged_icmp: false
+
+containerd_enable_selinux: false
+containerd_disable_apparmor: false
+containerd_tolerate_missing_hugetlb_controller: true
+containerd_disable_hugetlb_controller: true
+containerd_image_pull_progress_timeout: 5m
+
+containerd_cfg_dir: /etc/containerd
+
+# Extra config to be put in {{ containerd_cfg_dir }}/config.toml literally
+containerd_extra_args: ''
+
+# Configure registry auth (if applicable to secure/insecure registries)
+containerd_registry_auth: []
+#  - registry: 10.0.0.2:5000
+#    username: user
+#    password: pass
+
+# Configure containerd service
+containerd_limit_proc_num: "infinity"
+containerd_limit_core: "infinity"
+containerd_limit_open_file_num: 1048576
+containerd_limit_mem_lock: "infinity"
+
+# OS distributions that already support containerd
+containerd_supported_distributions:
+  - "CentOS"
+  - "OracleLinux"
+  - "RedHat"
+  - "Ubuntu"
+  - "Debian"
+  - "Fedora"
+  - "AlmaLinux"
+  - "Rocky"
+  - "Amazon"
+  - "Flatcar"
+  - "Flatcar Container Linux by Kinvolk"
+  - "Suse"
+  - "openSUSE Leap"
+  - "openSUSE Tumbleweed"
+  - "Kylin Linux Advanced Server"
+  - "UnionTech"
+  - "UniontechOS"
+  - "openEuler"
+
+# Enable container device interface
+enable_cdi: false
+
+# For containerd tracing configuration please check out the official documentation:
+# https://github.com/containerd/containerd/blob/main/docs/tracing.md
+containerd_tracing_enabled: false
+containerd_tracing_endpoint: "0.0.0.0:4317"
+containerd_tracing_protocol: "grpc"
+containerd_tracing_sampling_ratio: 1.0
+containerd_tracing_service_name: "containerd"
+
+
+# Set to true if your network does not support IPv6
+# This may be necessary for pulling Docker images from
+# GCE docker repository
+disable_ipv6_dns: false
+
+# Remove default cluster search domains (``default.svc.{{ dns_domain }}, svc.{{ dns_domain }}``).
+remove_default_searchdomains: false
+
+kube_owner: kube
+kube_cert_group: kube-cert
+kube_config_dir: /etc/kubernetes
+kube_cert_dir: "{{ kube_config_dir }}/ssl"
+kube_cert_compat_dir: /etc/kubernetes/pki
+kubelet_flexvolumes_plugins_dir: /usr/libexec/kubernetes/kubelet-plugins/volume/exec
+
+# Flatcar Container Linux by Kinvolk cloud init config file to define /etc/resolv.conf content
+# for hostnet pods and infra needs
+resolveconf_cloud_init_conf: /etc/resolveconf_cloud_init.conf
+
+# All inventory hostnames will be written into each /etc/hosts file.
+populate_inventory_to_hosts_file: true
+# K8S Api FQDN will be written into /etc/hosts file.
+populate_loadbalancer_apiserver_to_hosts_file: true
+# etc_hosts_localhost_entries will be written into /etc/hosts file.
+populate_localhost_entries_to_hosts_file: true
+
+sysctl_file_path: "/etc/sysctl.d/99-sysctl.conf"
+
+etc_hosts_localhost_entries:
+  127.0.0.1:
+    expected:
+      - localhost
+      - localhost.localdomain
+  ::1:
+    expected:
+      - localhost6
+      - localhost6.localdomain
+    unexpected:
+      - localhost
+      - localhost.localdomain
+
+# Minimal memory requirement in MB for safety checks
+minimal_node_memory_mb: 1024
+minimal_master_memory_mb: 1500
+
+yum_repo_dir: /etc/yum.repos.d
+
+# number of times package install task should be retried
+pkg_install_retries: 4
+
+# Check if access_ip responds to ping. Set false if your firewall blocks ICMP.
+ping_access_ip: true
+
+## NTP Settings
+# Start the ntpd or chrony service and enable it at system boot.
+ntp_enabled: false
+# The package to install which provides NTP functionality.
+# The default is ntp for most platforms, or chrony on RHEL/CentOS 7 and later.
+# The ntp_package can be one of ['ntp', 'ntpsec', 'chrony']
+ntp_package: >-
+      {% if ansible_os_family == "RedHat" -%}
+      chrony
+      {%- else -%}
+      ntp
+      {%- endif -%}
+
+# Manage the NTP configuration file.
+ntp_manage_config: false
+# Specify the NTP servers
+# Only takes effect when ntp_manage_config is true.
+ntp_servers:
+  - "0.pool.ntp.org iburst"
+  - "1.pool.ntp.org iburst"
+  - "2.pool.ntp.org iburst"
+  - "3.pool.ntp.org iburst"
+# Restrict NTP access to these hosts.
+# Only takes effect when ntp_manage_config is true.
+ntp_restrict:
+  - "127.0.0.1"
+  - "::1"
+# Specify whether to filter interfaces
+ntp_filter_interface: false
+# Specify the interfaces
+# Only takes effect when ntp_filter_interface is true
+# ntp_interfaces:
+#   - ignore wildcard
+#   - listen xxx
+# The NTP driftfile path
+# Only takes effect when ntp_manage_config is true.
+# Default value is `/var/lib/ntp/ntp.drift`, for ntpsec use '/var/lib/ntpsec/ntp.drift'
+ntp_driftfile: >-
+      {% if ntp_package == "ntpsec" -%}
+      /var/lib/ntpsec/ntp.drift
+      {%- else -%}
+      /var/lib/ntp/ntp.drift
+      {%- endif -%}
+# Only takes effect when ntp_manage_config is true.
+ntp_tinker_panic: false
+
+# Force sync time immediately after the ntp installed, which is useful in a newly installed system.
+ntp_force_sync_immediately: false
+
+# Set the timezone for your server.  eg: "Etc/UTC","Etc/GMT-8". If not set, the timezone will not change.
+ntp_timezone: ""
+
+# Currently known os distributions
+supported_os_distributions:
+  - 'RedHat'
+  - 'CentOS'
+  - 'Fedora'
+  - 'Ubuntu'
+  - 'Debian'
+  - 'Flatcar'
+  - 'Flatcar Container Linux by Kinvolk'
+  - 'Suse'
+  - 'openSUSE Leap'
+  - 'openSUSE Tumbleweed'
+  - 'ClearLinux'
+  - 'OracleLinux'
+  - 'AlmaLinux'
+  - 'Rocky'
+  - 'Amazon'
+  - 'Kylin Linux Advanced Server'
+  - 'UnionTech'
+  - 'UniontechOS'
+  - 'openEuler'
+
+# Extending some distributions into the redhat os family
+redhat_os_family_extensions:
+  - "UnionTech"
+  - "UniontechOS"
+
+# Sets DNSStubListener=no, useful if you get "0.0.0.0:53: bind: address already in use"
+systemd_resolved_disable_stub_listener: "{{ ansible_os_family in ['Flatcar', 'Flatcar Container Linux by Kinvolk'] }}"
+
+# Used to disable File Access Policy Daemon service.
+# If service is enabled, the CNI plugin installation will fail
+disable_fapolicyd: true
