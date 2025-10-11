@@ -136,22 +136,7 @@ pipeline {
                 // }
             }
         }
-        stage('notify autotest') {
-            when {
-                branch 'main'
-            }
-            agent {
-                node {
-                    label "dingo_stack"
-                }
-            }
-            steps {
-                script {
-                    echo "start notify autotest"
-                    sh ' /home/cicd/cronjob-trigger-autotest -token "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6IkFQSS1UT0tFTjphdXRvdGVzdC1hcGktdG9rZW4iLCJ2ZXJzaW9uIjoiMSIsImlzcyI6ImFwaVRva2VuSXNzdWVyIn0.2yrCOmQ-L6lzrrdLTcGx-i985829de4oVAOmHLni7k0" -jobs "unite-autotest:unite-beijing-1"'
-                }
-            }
-        }
+
         stage('deploy dingoOps to dev'){
             when {
                 anyOf { branch 'develop'; branch 'stable/2023.2' }
