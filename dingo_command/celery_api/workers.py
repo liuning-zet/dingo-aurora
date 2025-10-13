@@ -1464,6 +1464,13 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
         task_info.detail = TaskService.TaskDetail.pre_install.value
         update_task_state(task_info)
 
+        if cluster.type == "kubernetes":
+            # 从_meta.hostvars中获取master节点的IP
+            master_node_name = cluster_tfvars.cluster_name + "-master-1"
+            master_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ip"]
+            float_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
+            ssh_port = hosts_data["_meta"]["hostvars"][master_node_name].get("ansible_port", 22)
+
         # 2. 使用Ansible部署K8s集群
         cluster.id = cluster_tf_dict["id"]
         if scale:
@@ -1505,12 +1512,7 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
 
                 # 对于 hosted_k8s，使用控制平面 endpoint 作为 lb_ip
                 lb_ip = control_plane_endpoint.split(':')[0]  # 提取 IP 地址部分
-            else:
-                # 从_meta.hostvars中获取master节点的IP
-                master_node_name = cluster_tfvars.cluster_name + "-master-1"
-                master_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ip"]
-                float_ip = hosts_data["_meta"]["hostvars"][master_node_name]["ansible_host"]
-                ssh_port = hosts_data["_meta"]["hostvars"][master_node_name].get("ansible_port", 22)
+
             #调用keystoneclient的get_app_credential方法获取应用凭证，如果没有则用create_app_credential方法创建
             keystoneclient = KeystoneClient(token=cluster_tfvars.token, project_id=cluster.project_id)
             app_credential = keystoneclient.create_app_credential(user_id=cluster.user_id, name=cluster_tfvars.id)
