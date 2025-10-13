@@ -556,7 +556,9 @@ def deploy_kubernetes(cluster: ClusterObject, cluster_tf: ClusterTFVarsObject, l
             "external_openstack_lbaas_floating_network_id": cluster_tf.external_net,
             "external_openstack_lbaas_floating_subnet_id": cluster_tf.external_subnetids[0],
             "external_openstack_lbaas_subnet_ids": cluster_tf.admin_subnet_id,
-            "external_openstack_lbaas_network_id": cluster_tf.admin_network_id
+            "external_openstack_lbaas_network_id": cluster_tf.admin_network_id,
+            "external_openstack_lbaas_public_subnet_id": cluster_tf.public_subnetids[0],
+            "external_openstack_lbaas_public_network_id": cluster_tf.external_net
         }
         target_dir = os.path.join(WORK_DIR, "ansible-deploy", "inventory", str(cluster.id), "group_vars", "all")
         os.makedirs(target_dir, exist_ok=True)
@@ -708,7 +710,7 @@ def render_templatefile(template_file, cluster_file, context):
             loader=FileSystemLoader(template_dir),
             variable_start_string='${',
             variable_end_string='}',
-            autoescape=True
+            autoescape=False
         )
 
     # 获取模板并渲染
@@ -1526,6 +1528,7 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
         query_params["id"] = cluster_dict["id"]
         count, db_clusters = ClusterSQL.list_cluster(query_params)
         c = db_clusters[0]
+        cluster_pre_status = c.status
         c.status = 'running'
         c.status_msg = ""
         if not scale:
@@ -1540,9 +1543,9 @@ def create_k8s_cluster(self, cluster_tf_dict, cluster_dict, node_list, instance_
             for gpu_count_info in instances_gpu_count_info:
                 if gpu_count_info.resource_gpu_count is not None:
                     c.gpu = gpu_count_info.resource_gpu_count + c.gpu
-        print(f"start update cluster status {res}")
+        print(f"start update cluster status {cluster_pre_status}")
         res = ClusterSQL.update_cluster(c)
-        print(f"update cluster status to running {res}")
+        print(f"update cluster status to running {res.status}")
         results = install_app_chart(cluster.charts, cluster_dict["id"])
         print("results is:", results)
 

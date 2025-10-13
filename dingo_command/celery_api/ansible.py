@@ -47,6 +47,10 @@ class CustomCallback(CallbackBase):
 #     print(f"已切换到netns: {namespace}")
 
 def run_playbook(playbook_name, inventory, data_dir, ssh_key, extravars=None, limit=None, netns=None, cluster_id: str=None):
+    # 为每次任务生成独立目录
+    unique_dir = os.path.join(data_dir, "inventory", cluster_id, "private_data_dir")
+    os.makedirs(unique_dir, exist_ok=True)
+
     # 设置环境变量
     envvars = {
         "ANSIBLE_FORKS": 10,
@@ -62,11 +66,11 @@ def run_playbook(playbook_name, inventory, data_dir, ssh_key, extravars=None, li
             f.write(f"/usr/sbin/ip netns exec {netns} ssh \"$@\"\n")
         os.chmod(script_path, 0o755)
         envvars["ANSIBLE_SSH_EXECUTABLE"] = script_path
-    
+
     inventory_file = os.path.join(inventory, "hosts")
     # 运行 Ansible playbook 异步
     thread, runner = ansible_runner.run_async(
-        private_data_dir=data_dir,
+        private_data_dir=unique_dir,  # 独立目录
         playbook=playbook_name,
         inventory=inventory_file,
         quiet=True,
@@ -74,7 +78,7 @@ def run_playbook(playbook_name, inventory, data_dir, ssh_key, extravars=None, li
         extravars=extravars,
         ssh_key=ssh_key,
         limit=limit,
-        forks=50,
+        forks=50
     )
 
     return thread,runner

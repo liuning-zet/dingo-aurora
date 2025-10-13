@@ -1,0 +1,25 @@
+---
+- name: Remove-node | Delete node
+  command: "{{ kubectl }} delete node {{ kube_override_hostname | default(inventory_hostname) }}"
+  delegate_to: "{{ groups['kube_control_plane'] | first }}"
+  when:
+    - groups['kube_control_plane'] | length > 0
+    # ignore servers that are not nodes
+    - ('k8s_cluster' in group_names) and kube_override_hostname | default(inventory_hostname) in nodes.stdout_lines
+  retries: "{{ delete_node_retries }}"
+  # Sometimes the api-server can have a short window of indisponibility when we delete a control plane node
+  delay: "{{ delete_node_delay_seconds }}"
+  register: result
+  until: result is not failed
+
+- name: Check if kubelet.conf exists
+  stat:
+    path: "{{ kube_config_dir }}/kubelet.conf"
+    get_attributes: false
+    get_checksum: false
+    get_mime: false
+  register: kubelet_conf
+
+- name: Reset kubeadm if kubelet_conf is true
+  shell: kubeadm reset -f
+  when: kubelet_conf.stat.exists
